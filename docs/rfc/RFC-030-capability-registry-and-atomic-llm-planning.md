@@ -11,6 +11,8 @@ Date
 
 2026-08-31
 
+Revised: 2026-09-07 after architecture review.
+
 Related RFCs
 ------------
 
@@ -180,7 +182,7 @@ This is the behavior RFC-021 and RFC-028 intended to remove. The general agent l
 Root cause
 ----------
 
-The root cause is not insufficient model intelligence. It is **semantic authority fragmentation**:
+The architectural diagnosis is **semantic authority fragmentation**, rather than evidence of insufficient model intelligence:
 
 - one layer classifies intent;
 - another chooses a route without seeing its full shape;
@@ -195,6 +197,8 @@ Each layer is locally reasonable. Together they create information loss, duplica
 
 The second root cause is **modeling storage modes as separate semantic routes**. A user does not distinguish `lamp_exact` from `lamp_filters`; the user asks the catalog capability for a lamp or lamps under constraints. Exact, filtered, and hybrid access are execution modes of that capability.
 
+Atomic planning removes an information-loss boundary between capability selection and argument construction. It does not by itself prove retrieval relevance, completeness, or factual answer accuracy. Those require explicit input, execution, evidence, and answer contracts and independent evaluation.
+
 Goals
 -----
 
@@ -205,7 +209,8 @@ Goals
 - Keep structured filters, enums, hybrid search, optimized SQL, and read-only security boundaries.
 - Represent small talk, out-of-scope requests, blocked requests, clarification, and approved workspace-agent delegation as first-class outcomes.
 - Keep multi-table logic in reviewed backend workflows, not in free-form LLM tool loops.
-- Make an executor authoritative for its own result status.
+- Make an executor authoritative for execution status and observable evidence metadata, without treating non-empty retrieval as proof of a complete answer.
+- Preserve all explicit user constraints; distinguish exact matches, approximate candidates, partial evidence, and unknown coverage.
 - Prevent corporate retrieval from falling into the general ReAct loop.
 - Keep final user wording natural and evidence-grounded through a narrow no-tools finalizer call.
 - Make new capabilities easy to add through one registry row/spec, one schema, one executor, and tests.
@@ -236,7 +241,9 @@ A capability is a stable, allowlisted business operation with:
 - declared data sources/table scopes;
 - one normalized result contract.
 
-A capability may choose exact, structured, or hybrid access internally. Those are not separate top-level routing decisions unless they expose materially different user semantics.
+A capability may choose exact, structured, or hybrid access internally. Those are not separate top-level routing decisions unless they expose materially different user semantics. Strategy selection changes the access method, not the user's constraints.
+
+Consolidation requires a shared user operation, compatible input semantics, evidence/coverage rules, and no-result behavior. Shared tables, source files, or executors alone are insufficient. A `domain` argument is still a semantic choice: moving route IDs into an enum only helps when it removes duplicated behavior, not when it hides the old router inside one handler.
 
 ### One atomic semantic decision
 
@@ -260,7 +267,7 @@ An executor may use deterministic recovery inside its own capability, such as no
 
 ### No-tools finalization
 
-The answer finalizer receives only the user request, normalized capability result, and concise answer policy. It has no tools and cannot reopen retrieval.
+The answer finalizer receives only an immutable execution envelope, normalized capability result, and concise answer policy. The envelope contains the current user request, validated canonical arguments, and resolved dialog references. It has no tools and cannot reopen retrieval. Corporate factual claims must be supported by returned evidence, not model memory.
 
 Target high-level behavior
 --------------------------
@@ -282,9 +289,9 @@ A hard-blocked request returns the configured blocked response and records a sec
 The planner receives:
 
 - current user message;
-- a short dialog digest for follow-ups;
+- a bounded recent-dialog context for follow-ups, including the last validated plan and stable entity IDs from its result where available;
 - a compact capability registry;
-- each capability's selector-visible typed signature and compact enums;
+- each capability's generated selector-visible typed contract and compact enums;
 - the allowed non-retrieval outcomes.
 
 It returns exactly one discriminated action:
@@ -326,16 +333,22 @@ or, for example:
 
 The planner cannot return SQL, shell, file paths, executor names, evidence overrides, or arbitrary scripts.
 
+The current message overrides earlier constraints; inheritance is allowed only for explicit conversational references such as "из них". The planner emits the complete effective arguments, not a patch requiring a second semantic merge. Unresolved references require clarification. Dialog context is scoped to the session/user and bounded by configured turn and size limits; a topic change must not silently inherit the previous product or sphere.
+
+`delegate_workspace_agent` is the sole workspace entry action, not an alternative spelling of `execute_capability`. Its registered permission profile excludes corporate DB/search tools and corporate corpus access, including through shell/filesystem/network paths. Session permissions remain an upper bound. Corporate knowledge requests, including requests to use shell to read the corpus, cannot be fulfilled through this delegation. A mistaken initial delegation must not become an alternate corporate retrieval path.
+
 ### Step 2: schema validation and canonicalization
 
 Runtime:
 
 - verifies that `capability_id` is active and allowed for the session;
-- validates arguments against that capability's JSON Schema;
-- applies locked/default arguments;
-- resolves declared canonical aliases and enums;
-- rejects unknown fields;
-- permits at most one schema-local repair call if structured output is invalid.
+- rejects unknown fields and attempts to override locked scope/security arguments;
+- resolves declared canonical aliases and enums, applies declared defaults and locked arguments, then validates the complete effective arguments;
+- validates both JSON Schema and declared cross-field invariants, including range ordering and compatible field combinations;
+- permits at most one schema-local repair call for malformed output or invalid arguments, with the same capability after it is validly selected; unresolved business ambiguity returns clarification, not invented values;
+- returns a bounded planning error if repair fails; no executor or general agent is invoked.
+
+Defaults must not invent business constraints. Every explicit constraint remains mandatory unless the user explicitly replaces it in the current turn. Unsupported or contradictory combinations require clarification or a typed validation failure; silently ignoring a field is prohibited.
 
 Canonicalization may normalize an explicit alias such as `R500 2Ex` to `LAD LED R500 2Ex`. It must not infer a different business capability.
 
@@ -352,40 +365,77 @@ Examples:
 
 ### Step 4: normalized result contract
 
-Every capability returns:
+Every capability returns a schema-validated envelope with capability-specific typed `data`. The following illustrative catalog result distinguishes execution from coverage and links every fact to an entity and evidence source:
 
 ```json
 {
   "status": "success",
   "capability_id": "catalog_lamps.search",
-  "data": [],
-  "facts": [],
+  "coverage": "complete",
+  "coverage_basis": "Exhaustive scoped filter query; one matching row, no truncation",
+  "match_kind": "exact",
+  "data": [{"entity_id": "lamp:example", "series": "LAD LED R500 2Ex", "flux_lm": 12000}],
+  "facts": [{"entity_id": "lamp:example", "field": "flux_lm", "value": 12000, "source_ids": ["source:1"]}],
+  "sources": [{"source_id": "source:1", "entity_id": "lamp:example", "title": "Catalog record"}],
   "links": [],
-  "citations": [],
+  "missing_items": [],
+  "limitations": [],
   "clarification": null,
   "diagnostics": {
-    "execution_mode": "structured_filters",
-    "row_count": 3
+    "execution_strategy": "structured",
+    "row_count": 1,
+    "requested_constraints": {"series": "LAD LED R500 2Ex", "flux_lm_min": 11540},
+    "applied_constraints": {"series": "LAD LED R500 2Ex", "flux_lm_min": 11540}
   }
 }
 ```
 
 Allowed statuses are:
 
-- `success` — the executor completed its declared contract and returned answerable data;
-- `empty` — no matching data exists under the validated request;
+- `success` — the executor completed its declared operation and returned data/evidence; this is not a guarantee that the full user question is answered;
+- `empty` — the operation returned no matches within its declared source scope and search strategy; approximate search must not interpret this as proof that the information does not exist;
 - `needs_clarification` — the capability is correct, but a required business value is ambiguous or absent;
 - `error` — execution failed.
 
 The executor owns this status. The agent layer does not run a second route-specific relevance classifier.
 
+Evidence coverage is separate:
+
+- `complete` — all contract-defined requested items are covered, with a declared basis such as an exhaustive scoped lookup or a fully resolved bounded batch;
+- `partial` — some requested items are covered and identifiable items are missing or failed;
+- `unknown` — completeness cannot be established, the default for free-text top-k retrieval.
+
+`coverage` describes the declared operation, not an assertion that every relevant fact in the world was retrieved. `missing_items` is populated only when requested items are identifiable; an empty list with `unknown` coverage does not prove completeness. Per-item outcomes distinguish missing data from dependency errors in document batches and workflows. `limitations` records truncation, source scope, and incomplete workflow stages.
+
+`match_kind` is `exact`, `approximate`, `mixed`, or `not_applicable`. Approximate entity candidates are separate from confirmed matches in typed `data`; they must never be presented as exact product facts for the requested entity.
+
+Facts reference stable entity and source IDs. Search excerpts carry source IDs and source text; they are evidence candidates, not automatically verified answers. Links reference their source/entity IDs. Runtime validates reference integrity and allowlisted output fields, not business relevance. Diagnostics and internal table/path identifiers are excluded from the finalizer-visible projection.
+
+For company website/year/address requests, a result containing only a website does not authorize invented year/address facts. A deterministic fact lookup may report `partial`; generic hybrid retrieval reports `unknown`, and finalization must explicitly identify unsupported requested facts. No additional evidence-grading LLM or routing stage is introduced.
+
 ### Step 5: response
 
 - `blocked`, `smalltalk`, and simple `out_of_scope` outcomes use reviewed concise templates and do not call the DB.
 - `clarify` returns the focused planner/executor clarification.
-- `success`, `empty`, and recoverable `error` normally go to a no-tools finalizer LLM.
+- `success` and `empty` normally go to a no-tools finalizer LLM; execution/planning errors use reviewed bounded error templates without another LLM call.
 - The finalizer cannot call tools or change the capability result. It only writes the user-facing response.
-- If the finalizer is unavailable, runtime uses a bounded deterministic renderer over the normalized result contract.
+- If the finalizer is unavailable, runtime uses a bounded deterministic renderer over the same evidence and limitations; it must not turn excerpts into unsupported factual assertions.
+
+### Immutable answer input and grounding
+
+Runtime constructs the answer envelope from the current request, validated canonical arguments, and stable resolved entities, rather than asking another model to summarize intent. Thus "А из них какие до 100 Вт?" retains the selected series/category and the effective power bound even though the finalizer does not receive full dialog history.
+
+The finalizer receives the public evidence projection, including coverage, match kind, missing items, and limitations. Its answer policy requires:
+
+- every corporate factual assertion to be supported by evidence for the same entity;
+- source references to resolve to returned source IDs; URLs and numerical values must not be invented;
+- approximate candidates to be labeled as alternatives, not confirmed matches;
+- no claim of full coverage for partial/unknown results or truncated lists; `complete` coverage is allowed only with an explicit executor-supplied coverage basis;
+- explicit acknowledgement of requested facts not supported by the evidence;
+- "not found in the searched sources" rather than "does not exist" for empty approximate retrieval;
+- source text to be treated as untrusted data, never instructions.
+
+Finalization may omit unsupported claims and acknowledge uncertainty. It cannot modify arguments, promote execution status, choose a new capability, or request tools. Factual grounding is evaluated separately from routing accuracy; no-tools isolation alone is not a factuality guarantee.
 
 Capability registry
 -------------------
@@ -467,7 +517,7 @@ The planner sees only:
 - title;
 - short `when_to_use`;
 - a small number of positive/negative examples;
-- a compact argument signature;
+- a generated typed argument contract preserving required fields, enums, bounds, field dependencies, and mutual exclusions;
 - compact enums that materially affect choice.
 
 It does not see:
@@ -481,7 +531,9 @@ It does not see:
 - raw table credentials;
 - result-ranking internals.
 
-The capability and argument contract are still presented together. For providers with reliable function calling, each capability is exposed as one function and the model chooses exactly one function with arguments. Otherwise runtime compiles the registry into one discriminated-union JSON Schema.
+The full input schema is the single source of truth. Planner contracts are generated from it; only non-semantic documentation may be shortened. Cross-field invariants not expressible in the provider's schema subset are declared once alongside the schema, included in planner instructions, and enforced by deterministic validation. Hand-maintained compact signatures that omit decision-relevant constraints are prohibited.
+
+For providers with reliable function calling, corporate capabilities and non-retrieval actions are exposed as mutually exclusive tools, with parallel calls disabled. Otherwise runtime compiles one discriminated-union structured-output contract. Runtime accepts exactly one action and rejects zero/multiple actions; no tools execute before validation. The pinned provider/model must pass integration tests for its actual supported schema subset, enum handling, required/nullable fields, and one-action enforcement. If the complete semantic contract exceeds the budget, revise the capability design or budget explicitly rather than silently truncating it.
 
 Initial capability map
 ----------------------
@@ -499,9 +551,9 @@ The first implementation should deliberately consolidate current routes. The exa
 | `portfolio.search` | `portfolio`, `spheres`, hybrid index | named object and sphere portfolio lookup, distinguished by arguments rather than neighboring routes |
 | `application_recommendation.run` | reviewed multi-table workflow | current recommendation script over spheres, curated categories, lamps, and portfolio |
 | `document_corpus.search` | concrete indexed document domains | explicit search inside known documents; not a generic corporate fallback |
-| `workspace_agent.delegate` | session-permitted non-corporate tools | explicit entry into the existing ReAct agent for repository/sandbox work, never a corporate retrieval fallback |
+| `delegate_workspace_agent` (non-retrieval action) | session-permitted non-corporate tools | sole explicit entry into the existing ReAct agent for repository/sandbox work, with a corporate-access-denying permission profile |
 
-This map reduces semantic choices while preserving specialized executors behind the capability boundary.
+This map is a consolidation hypothesis, not a target count to optimize at the expense of semantics. Validate shared operation/input/evidence/no-result contracts before merging, especially for company facts, norms, and Luxnet. A `domain` enum must select a reviewed source scope under one shared contract, not dispatch to hidden route-specific fallback trees. Measure executor strategies, special cases, and state as well as visible capability count.
 
 ### Example: catalog capability
 
@@ -521,17 +573,38 @@ A single catalog capability can use a schema such as:
     "power_w_max": {"type": "integer", "minimum": 1, "maximum": 2000},
     "flux_lm_min": {"type": "integer", "minimum": 1, "maximum": 500000},
     "flux_lm_max": {"type": "integer", "minimum": 1, "maximum": 500000},
+    "examples_only": {"type": "boolean"},
     "limit": {"type": "integer", "minimum": 1, "maximum": 10}
-  }
+  },
+  "anyOf": [
+    {"required": ["query"]}, {"required": ["name"]},
+    {"required": ["series"]}, {"required": ["category"]},
+    {"required": ["ip"]}, {"required": ["power_w_min"]},
+    {"required": ["power_w_max"]}, {"required": ["flux_lm_min"]},
+    {"required": ["flux_lm_max"]}
+  ]
 }
 ```
 
-The backend selects execution mode deterministically:
+This is an illustrative subset, not the production filter inventory. The production schema preserves every supported normalized filter, rejects blank selectors, and declares these additional invariants:
 
-- exact `name` with no filters -> exact lookup;
-- any structured filter -> structured filter query;
-- approximate `query` without sufficient exact fields -> hybrid search;
-- category plus `examples_only=true` -> optimized showcase path.
+- each numeric minimum must be no greater than its maximum;
+- `examples_only=true` requires `category` and is incompatible with exact `name`;
+- every supplied exact field and structured constraint is combined with AND semantics;
+- `query` supplies approximate matching/ranking only; it never overrides exact fields or numeric bounds;
+- unsupported residual requirements expressed in `query` require clarification rather than being silently ignored.
+
+The backend selects execution strategy deterministically, without weakening these invariants:
+
+| Effective arguments | Strategy and semantics |
+|---|---|
+| Exact `name`, no other constraints | Exact entity lookup; a missing entity is not replaced by a similar one |
+| `name` plus filters | Resolve the exact entity and test all filters; mismatch returns no exact match |
+| Structured fields, optionally with `query` | Restrict candidates by all fields, then rank within that set using `query` if present |
+| Approximate `query` only | Bounded hybrid candidate search, labeled approximate |
+| Category plus `examples_only=true` | Bounded showcase query preserving all supplied filters and reporting its sample limit |
+
+Explicit constraints are never dropped or widened in v1. In particular, adapters must disable the current `_lamp_filters()` power-widening/category-dropping retries rather than wrapping their result as an exact success. An exact-name miss may return clearly separated approximate suggestions only where the capability contract explicitly supports them; suggestions cannot change `empty` exact-match semantics or acquire facts belonging to the requested name. Constraint-relaxation policies are deferred beyond v1.
 
 For the R500 2Ex incident, there is no competition between `catalog_lookup` and `lamp_filters`. The planner chooses `catalog_lamps.search` and supplies `series` plus `flux_lm_min`; the executor naturally uses the structured-filter path.
 
@@ -542,9 +615,9 @@ For the R500 2Ex incident, there is no competition between `catalog_lookup` and 
 - `domain`: `company_common|lighting_norms|luxnet`;
 - `query`: the user's natural question or a concise LLM-produced retrieval query;
 - `facets`: compact optional enum list;
-- `series`: optional canonical series enum where relevant.
+- `series`: optional bounded array of canonical series values, allowing comparisons without discarding one side of the request.
 
-`series_description` is not a separate capability from company common knowledge when both use the same source file and backend. Series is an argument/facet of the capability.
+`series_description` may merge with company knowledge when it shares the search and evidence contract, not merely because both use the same source file and backend. Series becomes an argument/facet. Domain/facet selection must be tested as semantic argument accuracy, even after the old route IDs disappear. If norms or Luxnet require materially different input, evidence, or no-result behavior, keep a distinct capability rather than conceal that difference behind `domain`.
 
 If natural conversational wording performs poorly in hybrid search, fix search normalization, indexing, or ranking in the executor. Do not introduce another Python router-side query rewrite for individual fact subtypes.
 
@@ -628,7 +701,7 @@ The system should not create four independent long-lived agents for routing, arg
    - read-only and bounded.
 
 3. **Finalizer LLM call**
-   - isolated context containing only the user request, normalized result, and answer policy;
+   - isolated context containing the immutable execution envelope, public evidence projection, and answer policy;
    - no tools;
    - no route catalog;
    - no ability to reopen retrieval.
@@ -702,18 +775,18 @@ A capability may perform bounded deterministic recovery inside its own data cont
 
 Examples:
 
-- normalized exact name -> exact prefix/series match -> bounded hybrid candidate search;
+- normalized exact name -> exact lookup; optional bounded approximate suggestions remain separately labeled and do not replace a missing exact match;
 - canonical enum match -> approved alias resolution;
 - lexical hybrid result -> semantic fallback inside the same source scope;
-- multi-name document batch where one name is absent but others succeed.
+- multi-name document batch where one name is absent but others succeed, with per-item outcomes and partial coverage.
 
-These are executor implementation details and appear as `diagnostics.execution_strategy`, not new semantic route choices.
+These are executor implementation details and appear as `diagnostics.execution_strategy`, not new semantic route choices. They preserve every explicit constraint and source scope. Internal recovery is not permission to remove a category, widen a numeric range, substitute an entity, or treat partial evidence as complete.
 
 ### Disallowed global fallback
 
 Runtime does not automatically switch from one business capability to another after `empty` or `error`.
 
-- `empty` -> answer no data or ask a capability-local clarification;
+- `empty` -> report no matches in the searched scope or ask a capability-local clarification; do not infer global absence from approximate search;
 - `needs_clarification` -> ask exactly that question;
 - `error` -> bounded service error;
 - suspected planner mismatch -> log for replay; do not launch a hidden route graph.
@@ -739,6 +812,10 @@ Canonical fields become:
 - `table_scopes`;
 - `result_status`;
 - `result_row_count`;
+- `result_coverage`;
+- `result_match_kind`;
+- `missing_item_count`;
+- `constraint_preservation_status`;
 - `finalizer_mode`;
 - `finalizer_latency_ms`;
 - `db_call_count`;
@@ -748,7 +825,9 @@ Fields such as `selected_family_id`, fallback route counts, fallback scope, rout
 
 Required dashboards/reports:
 
-- per-capability selection accuracy;
+- per-capability selection accuracy and domain/facet confusion within consolidated capabilities;
+- semantic argument accuracy and explicit-constraint preservation;
+- evidence relevance/coverage and answer factuality/completeness, scored separately;
 - first-pass argument validity;
 - result-status distribution;
 - planner and finalizer p50/p95;
@@ -772,7 +851,10 @@ CI validates:
 - every capability has positive and negative examples;
 - every capability has unit, integration, and benchmark ownership metadata;
 - no planner-visible arbitrary paths or executor internals;
-- compiled planner contract stays within the prompt-size budget.
+- compiled planner contract stays within the prompt-size budget without semantic truncation;
+- generated planner schemas retain all decision-relevant input constraints;
+- result fact/link/source references are valid and internal diagnostics are excluded from answer input;
+- declared cross-field validators and executor strategies have ownership and contract tests.
 
 ### Adding support for a new request
 
@@ -799,18 +881,21 @@ Migration plan
 2. Add repeated-run stability reporting, not only one-run accuracy.
 3. Generate an inventory mapping every current route to tables, executor modes, schema fields, fallback edges, and golden cases.
 4. Record current planner/finalizer latency, tokens, and cost.
+5. Inventory routing-specific orchestration and executor complexity: dispatch branches, strategies, exceptional rewrites, retry policies, and state fields. Record which will be deleted, retained, or replaced; moving a branch between modules is not a reduction.
+6. Freeze a held-out paraphrase/multi-turn/adversarial evaluation set independently of prompt examples.
 
 ### Phase 1: capability registry in shadow mode
 
 1. Add `core/capabilities/` and registry validation.
 2. Define the initial consolidated capability set.
-3. Compile it into an atomic planner contract.
-4. Run the new planner in shadow mode beside the existing router without executing it.
-5. Compare capability choice and arguments against current goldens and real traces.
+3. Compile it into an atomic planner contract and verify the pinned provider's schema/function-calling behavior.
+4. Implement shared validation, immutable execution/answer envelopes, normalized results, and the no-tools finalizer before the first live capability. Add adapters over reviewed APIs without retaining their constraint-relaxing behavior.
+5. Run the new planner in shadow mode beside the existing router without executing it.
+6. Compare capability choice and arguments against goldens and labeled real traces. Old route predictions are diagnostic baselines, not semantic ground truth.
 
-### Phase 2: first low-risk capabilities
+### Phase 2: first complete vertical slices
 
-Migrate capabilities with clear table contracts first:
+Migrate capabilities with clear table contracts through the entire new pipeline first:
 
 - catalog documents;
 - codes/SKU;
@@ -822,14 +907,17 @@ Expose both:
 - new `capability_id`;
 - compatibility `legacy_route_id` derived from validated arguments/result mode.
 
-This allows current strict route goldens to stay active during migration.
+Each migrated capability uses atomic planning -> validation -> constraint-preserving executor/adapter -> normalized evidence -> no-tools finalizer or direct renderer. It never enters the old evidence grader, fallback graph, or corporate ReAct path. Partial document batches exercise coverage and per-item outcomes from the first slice.
+
+Compatibility IDs are telemetry/test aliases only, never inputs to execution control. They allow legacy assertions to be checked where the mapping is unambiguous. For consolidated combinations without a one-to-one legacy route, maintain explicit versioned mappings and strict strategy/argument/fact assertions instead of inventing a legacy route to control behavior.
 
 ### Phase 3: catalog consolidation
 
 1. Introduce `catalog_lamps.search` over exact, structured, category, and hybrid modes.
 2. Make execution mode deterministic from validated arguments.
 3. Remove route competition between `catalog_lookup` and `lamp_filters`.
-4. Verify the complete Ex/2Ex incident dataset and all technical filter cases.
+4. Verify the complete Ex/2Ex incident dataset, all technical filter cases, exact-name-plus-filter combinations, and hybrid ranking within hard constraints.
+5. Assert requested/applied constraint equality and disable inherited filter-relaxation retries.
 
 ### Phase 4: knowledge consolidation
 
@@ -837,15 +925,16 @@ This allows current strict route goldens to stay active during migration.
 2. Remove `company_common` <-> `series_description` fallback semantics.
 3. Remove company subtype query rewriting from agent orchestration.
 4. Improve hybrid search/index behavior for natural questions where necessary.
-5. Verify repeated company-fact runs, not one lucky 26-case run.
+5. Verify repeated company-fact runs, not one lucky 26-case run, including partial facts and irrelevant non-empty retrieval.
+6. Validate consolidation by shared input/evidence semantics; retain separate capabilities if `domain` merely hides incompatible operations.
 
-### Phase 5: workflows and finalization
+### Phase 5: workflow coverage and complete cutover
 
-1. Register application recommendation and other stable multi-table flows as workflow capabilities.
-2. Normalize result contracts.
-3. Route successful results directly to a no-tools finalizer.
-4. Remove corporate retrieval entry into the ReAct loop.
-5. Keep ReAct only behind explicit `delegate_workspace_agent`.
+1. Register application recommendation and other stable multi-table flows as workflow capabilities using the already established normalized result/finalizer contracts.
+2. Represent incomplete workflow stages with coverage, limitations, and per-item outcomes.
+3. Complete migration of remaining corporate entry points; verify none can enter the old fallback/ReAct pipeline.
+4. Keep ReAct only behind explicit `delegate_workspace_agent`, enforcing corporate-access-denying permissions even when the initial planner choice is wrong.
+5. Confirm end-to-end grounding and renderer behavior for every capability, not only successful full-result paths.
 
 ### Phase 6: remove compatibility architecture
 
@@ -863,16 +952,20 @@ After full gate success:
 Rollout and rollback
 --------------------
 
-Use a runtime mode boundary:
+Use one mutually exclusive full-pipeline mode:
 
-- `routing_v2=current_routes`;
-- `routing_v3=capability_planner_shadow`;
-- `routing_v3=capability_planner_canary`;
-- `routing_v3=capability_planner_primary`.
+- `routing_mode=current_routes`;
+- `routing_mode=capability_planner_shadow`;
+- `routing_mode=capability_planner_canary`;
+- `routing_mode=capability_planner_primary`.
 
-Canary by admin/test users first. Every request records both old route prediction and new capability prediction while shadow mode is active.
+Canary by admin/test users first. Every eligible request records both old route prediction and new capability prediction while shadow mode is active. Only the active pipeline executes; shadow errors do not alter user-visible behavior. Report shadow overhead separately from target-path latency/cost.
 
-Rollback changes only the planner mode. Executors remain the same reviewed APIs during early phases, so rollback does not require a DB migration.
+During partial rollout, the registry marks which capabilities have complete vertical implementations. In canary, a new plan targeting an unmigrated capability transfers the untouched request to the intact legacy pipeline before any new execution, with explicit compatibility telemetry. This temporary coverage switch is not an `empty`/`error` fallback and is removed before primary acceptance. Migrated capabilities always run the full new path. Do not splice the new planner into old evidence/fallback orchestration.
+
+Before Phase 6, rollback switches the entire pipeline to `current_routes`, not just the planner. Reviewed APIs remain available to the legacy path; v3 adapters enforce the new contracts without changing legacy behavior. No DB migration is required.
+
+After Phase 6 removes the legacy pipeline, rollback requires deploying the retained pre-cleanup release artifact and its compatible configuration. Do not advertise a runtime switch to deleted code. Record and test the rollback procedure at each boundary.
 
 Testing approach
 ----------------
@@ -887,14 +980,22 @@ Testing approach
 - exact/structured/hybrid executor mode selection;
 - normalized result contracts;
 - finalizer cannot call tools;
-- workspace-agent delegation is explicit and permission-filtered.
+- workspace-agent delegation is explicit and permission-filtered, including corporate access through general tools;
+- generated planner contract preserves semantic schema constraints and cross-field invariants;
+- exact fields and numeric filters are conjunctive and cannot be silently dropped;
+- fact/source/entity references validate and diagnostics are not exposed to the finalizer;
+- partial batches, unknown search coverage, approximate candidates, and deterministic renderers preserve limitations.
 
 ### Deterministic contract tests
 
 - every capability executes directly with fixed arguments and fake dependencies;
 - all normalized lamp filter fields remain supported;
 - workflow capabilities query only declared tables/handlers;
-- security blocks occur before planner/executor invocation.
+- security blocks occur before planner/executor invocation;
+- adapters disable existing power-widening/category-dropping retries in v3;
+- query ranking runs within hard-filter candidate sets;
+- result-schema violations produce bounded errors rather than exposing unvalidated data;
+- mistaken workspace delegation cannot invoke corporate tools or read the corporate corpus through shell/filesystem/network paths.
 
 ### Planner tests with fake LLM
 
@@ -904,6 +1005,10 @@ Testing approach
 - locked arg override;
 - repair success/failure;
 - smalltalk/out-of-scope/clarify/delegate outcomes.
+
+### Provider contract tests
+
+On the pinned production provider/model, verify strict function/structured-output behavior, actual schema subset support, enum handling, and rejection of zero/multiple actions. Provider integration tests are separate from fake-LLM validation tests. Provider-reported model pins must match configuration; schema degradation must fail visibly rather than remove constraints.
 
 ### Production E2E
 
@@ -919,11 +1024,25 @@ Required cases include:
 - `Как дела?` -> smalltalk and zero DB calls;
 - weather -> out-of-scope and zero DB calls;
 - destructive DB request -> deterministic block and zero planner/DB calls;
-- approved git/repository task -> explicit workspace-agent delegation.
+- approved git/repository task -> explicit workspace-agent delegation;
+- exact model plus an incompatible power/flux constraint -> no exact match, not a different model;
+- approximate query plus series/IP/power bounds -> every returned candidate preserves the bounds;
+- request for website/year/address with only website evidence -> supported website plus explicit missing facts, no invented year/address;
+- irrelevant non-empty hybrid result -> no unsupported answer merely because execution succeeded;
+- missing exact entity with similar candidates -> clearly labeled suggestions, not an exact-match success;
+- partial document batch or workflow dependency failure -> per-item outcomes and partial coverage;
+- "А из них какие до 100 Вт?" -> resolved prior entities and complete effective arguments reach both executor and finalizer;
+- topic change -> no stale series/sphere/constraint inheritance;
+- corporate question mistakenly delegated to workspace -> no alternate corporate access;
+- adversarial instructions in retrieved text -> treated as evidence text, not finalizer instructions.
 
 ### Stability gate
 
-A single passing run is insufficient for stochastic production E2E.
+A single passing run is insufficient for stochastic production E2E. Three passing runs are a release smoke gate, not proof of routing or answer stability.
+
+Score four layers independently: capability selection (including domain/facets), semantic argument correctness/constraint preservation, evidence relevance/coverage, and final answer factuality/completeness. JSON validity and non-empty rows are not proxies for the latter layers. Use fixed expected facts and source/entity checks where deterministic; independently reviewed labels for open-text evidence/answers must not rely solely on the finalizer's self-assessment.
+
+Keep existing incident goldens and a separate held-out set of paraphrases, reordered constraints, multi-turn references/topic changes, partial results, and negative retrieval cases. Run each stability case at least 10 times on the pinned configuration, including capability-order permutations. Report per-case pass rates, sample sizes, observed failure types, and uncertainty rather than only an aggregate percentage. Any prompt/schema tuning based on held-out failures requires a fresh held-out set for acceptance.
 
 Before primary rollout:
 
@@ -933,7 +1052,10 @@ Before primary rollout:
 - no variation of company-fact failures between runs;
 - configured and provider-reported model pins match;
 - no weakening of facts, links, or filter arguments;
-- zero DB calls for every non-retrieval benchmark case.
+- zero DB calls for every non-retrieval benchmark case;
+- zero observed hard-constraint violations, unsupported required factual assertions, or corporate-access bypasses across the stability set;
+- no regression against the frozen baseline in any of the four independently scored layers, including per-capability and company-fact slices;
+- every missing required fact is either answered from evidence or explicitly acknowledged as unsupported; acknowledgement is measured separately from successful factual completion and cannot hide a retrieval regression.
 
 Performance and cost budgets
 ----------------------------
@@ -944,7 +1066,7 @@ Initial budgets:
 
 - planner calls per corporate request: 1 normally, 2 only after invalid structured output;
 - planner prompt: target <= 20 KB for the initial consolidated registry;
-- finalizer calls: 1 for retrieved answers, 0 for reviewed direct outcomes;
+- finalizer calls: 1 for retrieved answers, 0 for reviewed direct outcomes and planning/execution errors;
 - no general agent-loop call for corporate retrieval;
 - planner p95 no worse than current Call A + Call B aggregate p95;
 - total production-agent p95 and tokens no worse than the verified pre-migration baseline, with a target improvement from removing fallback and ReAct iterations.
@@ -980,7 +1102,7 @@ Risks and mitigations
 Mitigations:
 
 - consolidate only semantically overlapping modes;
-- use compact signatures for the planner, full schemas for runtime validation;
+- generate compact planner contracts from full schemas without dropping decision-relevant constraints;
 - include compact enums only where useful;
 - keep large free-text domains out of enums;
 - enforce prompt budgets in CI.
@@ -989,8 +1111,9 @@ Mitigations:
 
 Mitigations:
 
-- keep executor strategy explicit in diagnostics;
+- keep executor strategy and requested/applied constraints explicit in diagnostics;
 - maintain focused direct-tool tests per strategy;
+- measure special-case branches, retry policies, state fields, and duplicated schema logic across orchestration and executors, not only route count or orchestration LOC;
 - split a capability only when user semantics and input contract are genuinely different, not merely because SQL paths differ.
 
 ### One wrong capability no longer has automatic cross-family fallback
@@ -999,7 +1122,7 @@ This is intentional. Hidden fallback masks planner errors and creates incorrect 
 
 ### Compatibility route IDs change
 
-During migration, emit both `capability_id` and a derived `legacy_route_id`. Version the benchmark contract only after the new architecture is accepted and all factual/argument assertions remain strict.
+During migration, emit `capability_id` and a derived `legacy_route_id` where a reviewed mapping exists. Aliases never control execution. Version ambiguous consolidated mappings explicitly while retaining strict strategy, constraint, source, fact, and link assertions; a smaller ID set is not itself an accuracy improvement.
 
 Acceptance criteria
 -------------------
@@ -1013,7 +1136,7 @@ Acceptance criteria
 7. Runtime contains no production Python keyword classifier that reorders or overrides the capability planner's semantic choice.
 8. Agent orchestration does not rewrite capability arguments after validation except declared canonicalization and locked/default args.
 9. Every capability has one registered executor/workflow and one normalized result schema.
-10. The executor's `success|empty|needs_clarification|error` status is authoritative; agent orchestration does not apply a second route-specific evidence grader.
+10. The executor's `success|empty|needs_clarification|error` status is authoritative for execution, with separate coverage, match kind, and per-item outcomes. Non-empty search does not imply answerability; agent orchestration does not apply a second route-specific evidence grader.
 11. Corporate retrieval never enters the general ReAct loop after capability execution.
 12. The answer finalizer has no tools and cannot reopen retrieval.
 13. Small talk, self-description, out-of-scope, clarification, blocked request, and workspace-agent delegation are explicit top-level outcomes.
@@ -1023,4 +1146,11 @@ Acceptance criteria
 17. New request support follows the registry lifecycle: example/schema/executor/workflow/policy changes are chosen by failure type instead of defaulting to Python keyword patches.
 18. Current deterministic and factual goldens are not weakened; compatibility route IDs remain available during migration.
 19. RFC-028 baseline, Ex/2Ex runtime replay, and production-agent gates pass 100%, with the production-agent suite passing at least three consecutive full pinned-model runs.
-20. Routing-related Python and runtime state are net-reduced after compatibility cleanup, with removed split-call, fallback-graph, evidence-grading, and retrieval-ReAct machinery documented in the final migration report.
+20. Routing-related Python and runtime state are net-reduced after compatibility cleanup. The migration report inventories removed and retained branches, strategies, retry policies, and state across both orchestration and executors; relocating complexity is not counted as deletion.
+21. All explicit exact fields and structured constraints are preserved conjunctively; v3 never drops categories or widens numeric ranges. Conflicting combinations clarify/fail validation or return no match, never a silently broadened answer.
+22. The planner contract is generated from the authoritative schema without semantic truncation. Pinned-provider tests enforce the supported schema contract and exactly one action, independently of fake-LLM tests.
+23. The finalizer receives immutable effective arguments and resolved entities for follow-ups, plus evidence linked by source/entity IDs. It cannot invent corporate facts/URLs, present alternatives as exact matches, or hide missing evidence.
+24. Held-out repeated-run tests independently score routing, semantic arguments, evidence, and answer quality, including order permutations, multi-turn context, partial results, and irrelevant non-empty retrieval. The stability gate records no hard-constraint violations, unsupported required factual assertions, or corporate-access bypasses.
+25. Every live migrated capability uses a complete vertical new pipeline from its first canary deployment. Compatibility IDs never drive execution; rollback switches the whole pipeline before cleanup and uses a tested prior release artifact after cleanup.
+26. Workspace delegation denies corporate tools and indirect corpus access even after an incorrect initial planner decision. There is only one workspace delegation action.
+27. Capability consolidation is justified by shared business/input/evidence/no-result contracts, not just shared storage. Company domain/facet accuracy and executor special-case complexity remain visible after route consolidation.
