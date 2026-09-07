@@ -213,6 +213,33 @@ class RoutingGuardrailTests(unittest.TestCase):
         quality_route = quality_selection["selected"]
         self.assertEqual(quality_route["route_id"], "corp_kb.company_common")
 
+    def test_company_fact_evidence_rejects_partial_and_irrelevant_payloads(self):
+        cases = (
+            (
+                "Подскажи контакты компании.",
+                {"status": "success", "results": [{"heading": "Контактная информация", "preview": "Email: lad@ladled.ru"}]},
+                False,
+            ),
+            (
+                "Где находится головной офис компании?",
+                {"status": "success", "results": [{"heading": "Доступные серии освещения", "preview": "LAD LED R500, LAD LED R700"}]},
+                False,
+            ),
+            (
+                "Какой официальный сайт компании?",
+                {"status": "success", "results": [{"heading": "Контактная информация", "preview": "Телефон: +7 (351) 239-18-11"}]},
+                False,
+            ),
+            (
+                "Подскажи контакты компании.",
+                {"status": "success", "results": [{"heading": "Контактная информация", "preview": "Телефон: +7 (351) 239-18-11, email: lad@ladled.ru"}]},
+                True,
+            ),
+        )
+        for message, payload, expected in cases:
+            with self.subTest(message=message, payload=payload):
+                self.assertEqual(_MODULE._company_fact_payload_is_relevant(payload, message), expected)
+
     def test_broad_series_question_uses_series_description_leaf_route(self):
         response, exec_mock, meta = self._run_flow(
             user_message="Какие у вас есть серии светильников?",
@@ -701,7 +728,7 @@ class RoutingGuardrailTests(unittest.TestCase):
                         self.assertIn("comparisons", prompt)
                         self.assertIn("tempered-glass use", prompt)
                         self.assertIn("Do not select for comparisons between series", prompt)
-                        self.assertIn("Do not select for series-wide knowledge facts", prompt)
+                        self.assertIn("Do not use for general company facts", prompt)
 
     def test_selector_executes_scoped_route_and_finalizes_without_extra_tools(self):
         selector_response = {
@@ -2104,7 +2131,7 @@ class RoutingGuardrailTests(unittest.TestCase):
             corp_db_payload={
                 "status": "success",
                 "kind": "hybrid_search",
-                "results": [{"value": "https://ladzavod.ru"}],
+                "results": [{"value": "Телефон: +7 (351) 239-18-11, email: lad@ladled.ru, сайт: https://ladzavod.ru"}],
             },
             skill_mentions="## Available Skills\n\n| Skill | Description |\n|-------|-------------|\n| `corp-pg-db` | Corp skill |\n",
             wiki_tool_name="list_directory",
@@ -2352,8 +2379,12 @@ class RoutingGuardrailTests(unittest.TestCase):
         self.assertIn("239-18-11", response)
         self.assertIn("lad@ladled.ru", response)
         self.assertEqual(exec_mock.await_count, 1)
-        # RFC-028 workstream 3.4: no keyword-driven query rewrite; the raw user query is used as-is.
-        self.assertEqual(exec_mock.await_args_list[0].args[1]["query"], "контакты компании")
+        # Company-common fact routes use the canonical query shape to keep retrieval stable;
+        # selector arguments for other leaves remain untouched.
+        self.assertEqual(
+            exec_mock.await_args_list[0].args[1]["query"],
+            _MODULE._expand_company_fact_query("Подскажи контакты компании."),
+        )
         self.assertTrue(meta["company_fact_payload_relevant"])
         self.assertEqual(meta["company_fact_intent_type"], "contacts")
         self.assertEqual(meta["company_fact_finalizer_mode"], "llm")
@@ -2486,6 +2517,31 @@ class RoutingGuardrailTests(unittest.TestCase):
         self.assertEqual(meta["retrieval_retry_count"], 0)
         # The reworded retry returned sufficient evidence, so retrieval closes.
         self.assertEqual(meta["retrieval_phase"], "closed")
+
+    def test_company_fact_finalizer_recovers_missing_requested_fact_from_validated_payload(self):
+        response, exec_mock, meta = self._run_flow(
+            user_message="Какой официальный сайт у компании ЛАДзавод светотехники? Дай ссылку.",
+            corp_db_payload={
+                "status": "success",
+                "kind": "hybrid_search",
+                "results": [{
+                    "heading": "О компании",
+                    "preview": "Информация о компании доступна на сайте https://ladzavod.ru/about-us",
+                }],
+            },
+            corp_db_args={"kind": "hybrid_search", "profile": "kb_search", "query": "сайт"},
+            llm_responses_override=[
+                self._tool_call_response(
+                    "corp_db_search",
+                    {"kind": "hybrid_search", "profile": "kb_search", "query": "сайт"},
+                ),
+                self._final_response("В найденных данных сайт не указан."),
+            ],
+        )
+
+        self.assertIn("ladzavod.ru", response)
+        self.assertEqual(meta["company_fact_finalizer_mode"], "deterministic_company_fact_recovery")
+        self.assertEqual(exec_mock.await_count, 1)
 
     def test_about_company_uses_llm_finalization_with_full_runtime_payload_in_runtime_mode(self):
         response, exec_mock, meta = self._run_flow(
@@ -2929,8 +2985,13 @@ class RoutingGuardrailTests(unittest.TestCase):
         )
 
         self.assertIn("временно недоступен", response.lower())
-        self.assertEqual(exec_mock.await_count, 1)
+        # The initial company-fact payload is intentionally irrelevant to the contacts request;
+        # the declared series sibling is therefore attempted before the empty LLM completion is
+        # handled.  This preserves the strict evidence gate rather than treating a non-empty row as
+        # sufficient.
+        self.assertEqual(exec_mock.await_count, 2)
         self.assertEqual(exec_mock.await_args_list[0].args[0], "corp_db_search")
+        self.assertEqual(exec_mock.await_args_list[1].args[0], "corp_db_search")
         self.assertEqual(meta["retrieval_selected_source"], "corp_db")
         self.assertEqual(meta["finalizer_mode"], "unavailable")
 

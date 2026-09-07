@@ -9,7 +9,8 @@ summary: Source-scoped company KB for contacts, website, legal details, address,
   specific models/series (up to five per message).
 when_to_use: >-
   Select for general company facts: contacts, website, legal details, address, service, warranty, and
-  company-wide overviews not tied to specific named lamp models.
+  company-wide overviews not tied to specific named lamp models. Do not select for product-series
+  descriptions, comparisons, or series-wide technical facts.
 schema_ref: company_common.schema.json
 topics:
 - company
@@ -47,6 +48,10 @@ keywords:
 - описание серий
 - все серии
 patterns:
+- сколько лет компании
+- какой официальный сайт у компании
+- где находится головной офис компании
+- подскажи контакты компании
 - какие есть сертификаты
 - какие используются комплектующие
 - как контролируется качество

@@ -6,9 +6,11 @@ title: Series descriptions and lineup overview
 summary: Dedicated company-KB leaf route for series overviews, comparisons, and series-level facts.
 when_to_use: >-
   Select for knowledge questions about product series: what series exist, descriptions or comparisons
-  of one or more series, and series-wide facts such as materials or tempered-glass use. Do not use when
-  the user asks which models or series satisfy explicit structured constraints such as power, IP, flux,
-  voltage, dimensions, protection, or mounting type; keep the structured lamp-filter route available.
+  of one or more series, and series-wide facts such as materials or tempered-glass use. Do not use
+  for general company facts such as contacts, website, legal details, address, service, warranty,
+  company-wide overviews, or year founded. Do not use when the user asks which models or series
+  satisfy explicit structured constraints such as power, IP, flux, voltage, dimensions, protection,
+  or mounting type; keep the structured lamp-filter route available.
 schema_ref: series_description.schema.json
 topics:
 - series

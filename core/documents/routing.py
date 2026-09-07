@@ -1996,6 +1996,15 @@ def _infer_intent_family(query: str, *, explicit_document_request: bool) -> str:
         return "portfolio_lookup"
     if _is_mountings_family_query(query) or _is_structured_lamp_filter_query(query) or _is_exact_lamp_model_query(query):
         return "catalog_lookup"
+    # Words such as «офис» and «склад» occur in both application requests and company
+    # questions (e.g. the head-office address).  Treat a fact-shaped question as company Q&A
+    # unless it also contains an explicit recommendation/selection cue; otherwise the broad
+    # application keyword wins before the company-fact route can be considered.
+    company_fact_without_selection = _intent_contains(query_text, COMPANY_FACT_KEYWORDS) and not _intent_contains(
+        query_text, ("подбери", "подобрать", "рекоменд", "подход", "светильник", "освещен", "освещён")
+    )
+    if company_fact_without_selection:
+        return "company_fact"
     if _intent_contains(query_text, APPLICATION_RECOMMENDATION_KEYWORDS) or _intent_contains(query_text, ORCHESTRATION_KEYWORDS):
         return "application_recommendation"
     if _intent_contains(query_text, CATALOG_LOOKUP_KEYWORDS):
@@ -2480,6 +2489,18 @@ def build_route_selector_payload(
             max_routes=max_routes,
         )
         candidate_mode = "family_first_budgeted_by_family"
+    # The company KB has one physical source behind two semantic families: company facts and
+    # series knowledge.  Keep the series leaf available for catalog/series queries, but do not
+    # expose it as a company-fact candidate.  Otherwise an external selector can choose the
+    # overlapping leaf for a website/address/contact question and return a valid, non-empty yet
+    # irrelevant series payload; the runtime cannot make that initial selection deterministic.
+    if intent_family == "company_fact":
+        candidates = [
+            route
+            for route in candidates
+            if str(route.get("family_id") or "") == "company_info"
+            and _route_intent_family(route) == "company_fact"
+        ]
     compact_routes = [_compact_selector_route_card(route, sphere_context=sphere_context) for route in candidates]
     families = _selector_family_cards(compact_routes)
     return {

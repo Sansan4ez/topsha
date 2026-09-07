@@ -236,7 +236,7 @@ def _extract_matching_text(texts: list[str], keywords: tuple[str, ...]) -> str:
 
 def _extract_address_text(texts: list[str]) -> str:
     for text in texts:
-        match = re.search(r"адрес:\s*([^\\n]+?)(?:(?:телефон|e-mail|email|офис в|сайт):|$)", str(text), flags=re.IGNORECASE)
+        match = re.search(r"адрес:\s*([^\n]+?)(?:(?:телефон|e-mail|email|офис в|сайт):|$)", str(text), flags=re.IGNORECASE)
         if match:
             return match.group(1).strip(" ,.;")
     return _extract_matching_text(
@@ -271,18 +271,28 @@ def _company_fact_payload_is_relevant(payload: dict[str, Any], message: str) -> 
     socials = _extract_social_text(texts)
     requisites = _extract_requisites_text(texts)
 
+    # A scoped KB response can be non-empty without answering the request (for example, a
+    # quality paragraph returned for an address question).  Keep the evidence gate tied to the
+    # requested fact instead of treating every row from the shared company document as enough.
+    # Contacts deliberately require both canonical channels: accepting an email-only partial row
+    # was the production failure mode behind mk-008.
     if subtype == "website":
-        return bool(website)
+        return bool(website) and "ladzavod.ru" in " ".join(texts).casefold()
     if subtype == "year_founded":
-        return bool(year)
+        return bool(year) and _texts_contain_any(texts, ("основан", "год основания", "история"))
     if subtype == "address":
-        return bool(address) or _texts_contain_any(texts, ("контактная информация", "адрес", "офис"))
+        address_has_location = _texts_contain_any(
+            texts, ("челябинск", "чайковского", "ул.", "улиц", "дом", "д.")
+        )
+        return address_has_location and _texts_contain_any(texts, ("адрес", "офис"))
     if subtype == "contacts":
-        return bool(phone or email or website or address) or _texts_contain_any(texts, ("контактная информация", "контакты"))
+        return bool(phone and email) and _texts_contain_any(
+            texts, ("контактная информация", "контакты", "телефон", "email", "e-mail")
+        )
     if subtype == "requisites":
-        return bool(requisites) or _texts_contain_any(texts, ("реквизиты",))
+        return bool(requisites) and _texts_contain_any(texts, ("реквизиты", "инн", "кпп", "огрн"))
     if subtype == "socials":
-        return bool(socials)
+        return bool(socials) and _texts_contain_any(texts, ("социальн", "telegram", "youtube", "vk", "сайт"))
     if subtype == "certification":
         return _texts_contain_any(texts, COMPANY_COMMON_FACET_KEYWORDS["certification"])
     if subtype == "quality":
@@ -530,6 +540,21 @@ def _route_evidence_status(
         return _doc_domain_evidence_status(tool_result, args=args, state=state)
     if name != "corp_db_search":
         return "weak"
+    # Company-fact requests are semantic contracts, even though the common and series leaves
+    # share one physical KB source.  A non-empty row from that source is not enough: a series
+    # listing, an "about" paragraph without the requested value, or a contacts row containing
+    # only one channel must stay retryable/fallback-eligible.  This check intentionally uses the
+    # user request rather than keywords added to tool args, so partial/irrelevant fake payloads
+    # exercise the same guard as production responses.
+    if _company_fact_intent_type(message):
+        payload = _parse_json_object(tool_result.output or "")
+        if payload.get("status") == "empty":
+            return "empty"
+        if _company_fact_payload_is_relevant(payload, message):
+            return "sufficient"
+        # A scoped but irrelevant result must remain retryable.  Do not classify it as an error:
+        # the tool completed successfully and a declared fallback may still recover the fact.
+        return "weak"
     if _has_authoritative_kb_route(state):
         return _authoritative_kb_evidence_status(args, tool_result, message, state)
     if not tool_result.success:
@@ -575,8 +600,20 @@ def _route_execution_args(route_hint: dict[str, Any], query: str) -> dict[str, A
     # narrow, verified-necessary exception to "the selector's own job fills query" -- not a
     # reintroduction of RFC-028's removed keyword rewrite, which also touched topic_facets and
     # every corp_kb route.
-    if str(route_hint.get("route_id") or "") == "corp_kb.company_common" and str(args.get("query") or "") == str(query or ""):
+    if (
+        str(route_hint.get("route_id") or "") == "corp_kb.company_common"
+        and _company_fact_intent_type(query)
+    ):
+        # The company-common leaf is a source-backed fact route.  Use its canonical query shape
+        # for every company-fact request, not only when Call B echoed the user text byte-for-byte.
+        # Call B remains authoritative for all other routes; this narrow leaf-level normalization
+        # prevents harmless wording/topic-facet variation from selecting an irrelevant chunk.
         args["query"] = _expand_company_fact_query(query)
+        # The canonical fact query already carries the requested topic.  A selector-supplied
+        # facet such as `website` can over-constrain the shared hybrid index toward a neighboring
+        # heading (for example social links) and produce a non-empty but irrelevant payload.
+        if _company_fact_intent_type(query) in {"website", "year_founded", "address", "contacts"}:
+            args.pop("topic_facets", None)
     return args
 
 
@@ -1177,6 +1214,26 @@ async def _finalize_or_fail_closed(
         return _finalizer_unavailable_response(routing_state, error=exc)
 
     if str(final_response or "").strip():
+        # The retrieval gate proves that the payload answers this company fact, but an external
+        # finalizer can still omit or contradict it.  Recover from the same validated evidence
+        # deterministically rather than returning a fluent "not found" answer.  This is a bounded
+        # finalization safeguard, not a keyword-based retrieval rewrite and does not run for other
+        # route families.
+        if (
+            routing_state.get("intent") == "company_fact"
+            and not _company_fact_answer_is_complete(final_response, str(routing_state.get("user_message") or ""))
+        ):
+            payload = _parse_json_object(tool_result.output or "")
+            recovered = _render_company_fact_payload(
+                payload, str(routing_state.get("user_message") or "")
+            )
+            if recovered and _company_fact_answer_is_complete(
+                recovered, str(routing_state.get("user_message") or "")
+            ):
+                routing_state["finalizer_mode"] = "deterministic_company_fact_recovery"
+                routing_state["company_fact_finalizer_mode"] = "deterministic_company_fact_recovery"
+                _update_routing_observability(routing_state)
+                return recovered
         return final_response
     return _finalizer_unavailable_response(routing_state, error="finalizer returned empty content")
 
@@ -1394,6 +1451,13 @@ async def _try_family_local_route_fallbacks(
         fallback_status_state = dict(routing_state)
         if local_to_family:
             fallback_status_state["knowledge_route_id"] = ""
+        # Evaluate fallback evidence against the fallback leaf, not the original leaf.  This is
+        # important for company facts because company_common and series_description intentionally
+        # share one source file but have different semantic contracts.
+        fallback_status_state["route_id"] = str(fallback_route_hint.get("route_id") or "")
+        fallback_status_state["retrieval_leaf_route_id"] = str(
+            fallback_route_hint.get("leaf_route_id") or fallback_route_hint.get("route_id") or ""
+        )
         evidence_status = _route_evidence_status(
             fallback_tool_name,
             fallback_args,
@@ -1926,10 +1990,18 @@ def _extract_first_match(pattern: re.Pattern[str], texts: list[str]) -> str:
 
 
 def _collect_result_texts(payload: dict[str, Any]) -> list[str]:
-    previews = _collect_preview_texts(payload)
-    if previews:
-        return previews
+    # Runtime company-KB rows can place the matching URL/contact/value in `content`, while the
+    # compact preview is ranked from a neighboring heading.  Preserve textual evidence fields in
+    # evidence-first order and retain the historical preview-first behavior used by renderers.
     rows = _company_fact_rows(payload)
+    texts: list[str] = []
+    for row in rows:
+        for key in ("content", "preview", "snippet", "value"):
+            value = str(row.get(key) or "").strip()
+            if value and value not in texts:
+                texts.append(value)
+    if texts:
+        return texts
     return _collect_row_texts(rows)
 
 
@@ -1979,6 +2051,29 @@ def _preferred_company_fact_texts(payload: dict[str, Any], subtype: str) -> list
             return _collect_result_texts(preferred_payload)
 
     return _collect_result_texts(payload)
+
+
+def _company_fact_answer_is_complete(answer: str, message: str) -> bool:
+    """Check only the fact requested by the user, without requiring wording from the LLM."""
+    subtype = _company_fact_intent_type(message)
+    text = _normalize_routing_text(answer)
+    if not text:
+        return False
+    if subtype == "website":
+        return "ladzavod.ru" in text
+    if subtype == "year_founded":
+        return bool(YEAR_RE.search(answer))
+    if subtype == "address":
+        return _text_has_any(text, ("челябинск", "чайковского")) and bool(
+            _text_has_any(text, ("дом", "д.", "адрес", "улиц", "ул."))
+        )
+    if subtype == "contacts":
+        return bool(PHONE_RE.search(answer)) and bool(EMAIL_RE.search(answer))
+    if subtype == "requisites":
+        return _text_has_any(text, ("инн", "кпп", "огрн"))
+    if subtype == "socials":
+        return _text_has_any(text, ("telegram", "youtube", "vk", "вконтакте", "t.me/"))
+    return _text_has_any(text, ("ладзавод", "производ", "разработ", "светотехнич"))
 
 
 def _render_company_fact_payload(payload: dict[str, Any], message: str) -> str:
@@ -3807,12 +3902,12 @@ async def _select_route_with_llm(
     # normalize or accidentally drop names; comparing its result with this independent stage-A
     # payload lets the certificate fast path fail closed without parsing the user's prose.
     try:
-        selector_payload = json.loads(selector_content)
+        selector_output = json.loads(selector_content)
     except (TypeError, json.JSONDecodeError):
-        selector_payload = {}
+        selector_output = {}
     selector_declared_tool_args = (
-        dict(selector_payload.get("tool_args") or {})
-        if isinstance(selector_payload, dict) and isinstance(selector_payload.get("tool_args"), dict)
+        dict(selector_output.get("tool_args") or {})
+        if isinstance(selector_output, dict) and isinstance(selector_output.get("tool_args"), dict)
         else {}
     )
 
