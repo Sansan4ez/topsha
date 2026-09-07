@@ -1437,6 +1437,16 @@ async def _try_family_local_route_fallbacks(
 
     current_route = dict(selected_route)
     visited_route_ids = {str(current_route.get("route_id") or "")}
+    # company_common and series_description share one physical source, but they do not share
+    # answer semantics. A series chunk can never recover an address/contact/website request.
+    # Keep the sibling fallback only for series-shaped questions; otherwise continue with the
+    # existing authoritative company-fact retry/general fallback path.
+    if (
+        str(current_route.get("route_id") or "") == "corp_kb.company_common"
+        and _company_fact_intent_type(message) not in {"", "about_company"}
+        and "series" not in _company_common_topic_facets(message)
+    ):
+        visited_route_ids.add("corp_kb.series_description")
     attempts_remaining = 4
 
     while attempts_remaining > 0:

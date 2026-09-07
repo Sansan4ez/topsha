@@ -1790,6 +1790,26 @@ class RoutingGuardrailTests(unittest.TestCase):
         self.assertEqual(meta["company_fact_finalizer_mode"], "llm")
         self.assertEqual(meta["execution_mode"], "runtime")
 
+    def test_irrelevant_company_address_payload_does_not_fallback_to_series_leaf(self):
+        response, exec_mock, meta = self._run_flow(
+            user_message="Где находится головной офис компании? Укажи город и адрес.",
+            corp_db_payload={
+                "status": "success",
+                "kind": "hybrid_search",
+                "results": [{"heading": "Серии", "preview": "LAD LED R500 и LAD LED R700"}],
+            },
+            wiki_tool_name="doc_search",
+            wiki_tool_args={"query": "адрес компании"},
+        )
+
+        self.assertIn("ladzavod.ru", response)
+        corp_calls = [call for call in exec_mock.await_args_list if call.args[0] == "corp_db_search"]
+        self.assertTrue(corp_calls)
+        self.assertFalse(
+            any((call.args[1].get("topic_facets") or []) == ["series"] for call in corp_calls)
+        )
+        self.assertNotEqual(meta.get("retrieval_leaf_route_id"), "series_description")
+
     def test_empty_corp_db_allows_wiki_fallback(self):
         response, exec_mock, meta = self._run_flow(
             user_message="Какой официальный сайт у компании ЛАДзавод светотехники?",
@@ -1799,14 +1819,11 @@ class RoutingGuardrailTests(unittest.TestCase):
         )
 
         self.assertIn("ladzavod.ru", response)
-        # RFC-028 workstream 3.4: company_info now attempts its declared family-local fallback
-        # (corp_kb.company_common -> corp_kb.series_description) before falling through to the
-        # general agent loop, so there is one more corp_db_search call than before that fallback
-        # was wired up.
-        self.assertEqual(exec_mock.await_count, 3)
+        # A series-description sibling cannot answer website/address/contact facts. Skip that
+        # semantic mismatch and let the general document fallback run directly.
+        self.assertEqual(exec_mock.await_count, 2)
         self.assertEqual(exec_mock.await_args_list[0].args[0], "corp_db_search")
-        self.assertEqual(exec_mock.await_args_list[1].args[0], "corp_db_search")
-        self.assertEqual(exec_mock.await_args_list[2].args[0], "doc_search")
+        self.assertEqual(exec_mock.await_args_list[1].args[0], "doc_search")
         self.assertEqual(meta["retrieval_selected_source"], "doc_search")
         self.assertEqual(meta["routing_guardrail_hits"], 0)
         self.assertEqual(meta["retrieval_phase"], "open")
@@ -2635,14 +2652,12 @@ class RoutingGuardrailTests(unittest.TestCase):
         )
 
         self.assertIn("ladzavod.ru", response)
-        # RFC-028 workstream 3.4: primary attempt (empty) + one declared family-local fallback
-        # attempt (corp_kb.company_common -> corp_kb.series_description, also empty) before the
-        # ReAct loop's two identical re-attempts get blocked outright as repeats of the same
-        # already-tried authoritative KB scope.
+        # The semantically unrelated series sibling is skipped. The primary company lookup and
+        # one distinct general-loop attempt execute; the exact duplicate is blocked.
         self.assertEqual(exec_mock.await_count, 2)
         self.assertEqual(exec_mock.await_args_list[0].args[0], "corp_db_search")
         self.assertEqual(exec_mock.await_args_list[1].args[0], "corp_db_search")
-        self.assertEqual(meta["routing_guardrail_hits"], 2)
+        self.assertEqual(meta["routing_guardrail_hits"], 1)
         self.assertEqual(meta["retrieval_phase"], "open")
 
     def test_application_recommendation_runtime_answer_does_not_leak_compact_preview(self):
@@ -3090,13 +3105,10 @@ class RoutingGuardrailTests(unittest.TestCase):
         )
 
         self.assertIn("временно недоступен", response.lower())
-        # The initial company-fact payload is intentionally irrelevant to the contacts request;
-        # the declared series sibling is therefore attempted before the empty LLM completion is
-        # handled.  This preserves the strict evidence gate rather than treating a non-empty row as
-        # sufficient.
-        self.assertEqual(exec_mock.await_count, 2)
+        # The initial payload is irrelevant, but the series sibling cannot answer contacts and is
+        # skipped before the empty LLM completion is handled.
+        self.assertEqual(exec_mock.await_count, 1)
         self.assertEqual(exec_mock.await_args_list[0].args[0], "corp_db_search")
-        self.assertEqual(exec_mock.await_args_list[1].args[0], "corp_db_search")
         self.assertEqual(meta["retrieval_selected_source"], "corp_db")
         self.assertEqual(meta["finalizer_mode"], "unavailable")
 
