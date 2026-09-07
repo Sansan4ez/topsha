@@ -94,7 +94,12 @@ def _load_route_module(*, update_recorder):
     sys.modules["pgvector.asyncpg"] = types.SimpleNamespace(register_vector=lambda *args, **kwargs: None)
     sys.modules["pydantic"] = types.SimpleNamespace(BaseModel=_FakeBaseModel, Field=_fake_field)
     sys.modules["prometheus_client"] = types.SimpleNamespace(Counter=lambda *args, **kwargs: _Metric(), Gauge=lambda *args, **kwargs: _Metric(), Histogram=lambda *args, **kwargs: _Metric())
-    sys.modules["opentelemetry"] = types.SimpleNamespace(trace=types.SimpleNamespace(get_tracer=lambda *args, **kwargs: _DummyTracer()))
+    sys.modules["opentelemetry"] = types.SimpleNamespace(
+        trace=types.SimpleNamespace(
+            get_tracer=lambda *args, **kwargs: _DummyTracer(),
+            get_current_span=lambda: _DummySpan(),
+        )
+    )
 
     src_pkg = types.ModuleType("src")
     src_pkg.__path__ = []
@@ -150,7 +155,11 @@ class ToolsApiCorrelationTests(unittest.TestCase):
             return _DummyPool()
 
         async def _fake_lamp_filters(conn, req, limit, offset):
-            return {"status": "success", "kind": "lamp_filters", "results": [], "filters": {}}
+            return module._success(
+                "lamp_filters",
+                applied_filter_fields=(),
+                results=[{"lamp_id": "fixture-lamp"}],
+            )
 
         module._get_pool = _fake_get_pool
         module._lamp_filters = _fake_lamp_filters
