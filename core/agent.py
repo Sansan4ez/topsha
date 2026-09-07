@@ -855,6 +855,39 @@ def _application_portfolio_response(
     return _render_application_payload(payload)
 
 
+def _certificate_evidence_details(document: dict[str, Any]) -> tuple[str, str]:
+    """Return explicitly supplied certificate subtype and scope, never cues from prose.
+
+    The catalog currently has only a generic ``certificate_url``.  Keep the renderer ready
+    for a richer source payload, but require fields that are explicitly marked as evidence.
+    In particular, a document title, URL, requested subtype, or lamp series is not evidence
+    that a certificate is CE/fire or that it covers a whole series.
+    """
+    evidence = document.get("evidence") if isinstance(document.get("evidence"), dict) else {}
+    subtype = ""
+    scope = ""
+    for key in ("verified_subtype", "certificate_subtype"):
+        value = document.get(key) or evidence.get(key) or evidence.get("subtype")
+        if str(value or "").strip():
+            subtype = str(value).strip()
+            break
+    for key in ("verified_scope", "certificate_scope", "coverage"):
+        value = document.get(key) or evidence.get(key) or evidence.get("scope")
+        if str(value or "").strip():
+            scope = str(value).strip()
+            break
+    return subtype, scope
+
+
+def _certificate_subtype_label(subtype: str) -> str:
+    normalized = _normalize_document_series_name(subtype)
+    if normalized in {"ce", "ce-сертификат", "сертификат ce"}:
+        return "CE-сертификат"
+    if normalized in {"fire", "пожарный", "пожарный сертификат", "fire certificate"}:
+        return "Пожарный сертификат"
+    return f"Сертификат (подтип: {subtype})" if subtype else "Сертификат"
+
+
 def _certificate_direct_link_response(
     *,
     message: str,
@@ -863,13 +896,12 @@ def _certificate_direct_link_response(
     tool_result: ToolResult,
     route_hint: dict[str, Any] | None,
 ) -> str:
-    """Render a complete multi-series certificate-link answer without an LLM round trip.
+    """Render bounded certificate links using only the evidence in each result.
 
-    ``catalog_lamp_documents`` intentionally exposes the catalogue's generic certificate
-    field rather than guessing a certificate subtype from a SKU.  For an explicit direct-link
-    request, that is nevertheless complete evidence: every requested series has a storage URL.
-    Rendering it directly prevents a finalizer from turning an already-complete answer into a
-    request for a particular SKU merely because the document title is just "Сертификат".
+    ``catalog_lamp_documents`` exposes a generic certificate URL.  The fast path may render
+    that useful link directly, but must not turn a requested subtype or a series name into
+    evidence.  A richer executor payload can opt into a subtype/scope label through explicit
+    verified fields; titles and URLs alone never do so.
     """
     if tool_name != "corp_db_search":
         return ""
@@ -891,10 +923,10 @@ def _certificate_direct_link_response(
         return ""
 
     rows = [row for row in payload["results"] if isinstance(row, dict)]
-    direct_links: list[tuple[str, str]] = []
+    direct_links: list[tuple[str, str, str, str, str, str]] = []
     for requested_name in requested_names:
         normalized_name = _normalize_document_series_name(requested_name)
-        matched_url = ""
+        matched: tuple[str, str, str, str, str] | None = None
         for row in rows:
             row_name = _normalize_document_series_name(row.get("name"))
             if not (row_name == normalized_name or row_name.startswith(f"{normalized_name}-") or row_name.startswith(f"{normalized_name} ")):
@@ -902,25 +934,47 @@ def _certificate_direct_link_response(
             primary = row.get("primary_document") if isinstance(row.get("primary_document"), dict) else {}
             if str(primary.get("document_type") or "") != "certificate":
                 continue
-            matched_url = str(primary.get("url") or "").strip()
-            if matched_url:
+            url = str(primary.get("url") or "").strip()
+            if url:
+                title = str(primary.get("title") or "Сертификат").strip() or "Сертификат"
+                subtype, scope = _certificate_evidence_details(primary)
+                matched = (str(row.get("name") or requested_name).strip(), title, url, subtype, scope)
                 break
         # A partial response must retain normal evidence finalization, which can explain what
         # was and was not found.  Deterministic rendering is reserved for complete requests.
-        if not matched_url:
+        if matched is None:
             return ""
-        direct_links.append((requested_name, matched_url))
+        direct_links.append((requested_name, *matched))
 
-    lines = ["Прямые ссылки на сертификаты:"]
-    for requested_name, url in direct_links:
-        normalized_name = _normalize_document_series_name(requested_name)
-        if "ce" in message_text and "r500" in normalized_name:
-            label = "CE-сертификат"
-        elif "пожар" in message_text and ("line" in normalized_name or "r700" in normalized_name):
-            label = "Пожарный сертификат"
-        else:
-            label = "Сертификат"
-        lines.append(f"- {label} для {requested_name}: {url}")
+    requested_subtypes: list[str] = []
+    if "ce" in message_text:
+        requested_subtypes.append("CE")
+    if "пожар" in message_text or "fire" in message_text:
+        requested_subtypes.append("пожарный")
+    requested_subtype = " или ".join(requested_subtypes)
+
+    lines = ["Прямые ссылки на найденные сертификаты:"]
+    for requested_name, actual_name, title, url, subtype, scope in direct_links:
+        label = _certificate_subtype_label(subtype)
+        scope_suffix = f"; охват: {scope}" if scope else ""
+        lines.append(f"- {label} «{title}» для сущности {actual_name}{scope_suffix}: {url}")
+        scope_matches_request = bool(scope) and _normalize_document_series_name(scope) == _normalize_document_series_name(requested_name)
+        entity_matches_request = actual_name.casefold() == requested_name.casefold()
+        if requested_subtype and not subtype:
+            lines.append(
+                f"  Ограничение: найден общий сертификат для {actual_name}; "
+                f"подтип {requested_subtype} и охват запроса «{requested_name}» не подтверждены."
+            )
+        elif requested_subtype and not scope_matches_request:
+            lines.append(
+                f"  Ограничение: подтип {subtype} указан в данных, но охват запроса "
+                f"«{requested_name}» не подтверждён."
+            )
+        elif not entity_matches_request and not scope_matches_request:
+            lines.append(
+                f"  Ограничение: ссылка относится к сущности «{actual_name}»; "
+                f"охват «{requested_name}» не подтверждён."
+            )
     return "\n".join(lines)
 
 

@@ -843,11 +843,65 @@ class RoutingGuardrailTests(unittest.TestCase):
             route_hint={"route_id": "corp_db.certificate_by_lamp_name"},
         )
 
-        self.assertIn("CE-сертификат для LAD LED R500", response)
-        self.assertIn("Пожарный сертификат для LAD LED LINE", response)
-        self.assertIn("Пожарный сертификат для LAD LED R700", response)
+        self.assertNotIn("CE-сертификат для LAD LED R500", response)
+        self.assertNotIn("Пожарный сертификат для LAD LED LINE", response)
+        self.assertNotIn("Пожарный сертификат для LAD LED R700", response)
+        self.assertEqual(response.count("подтип CE или пожарный и охват запроса"), 3)
         for url in certificate_urls.values():
             self.assertIn(url, response)
+
+    def test_certificate_direct_link_uses_explicit_subtype_and_scope_evidence(self):
+        payload = {
+            "status": "success",
+            "kind": "lamp_documents_index",
+            "filters": {"names": ["LAD LED R500"], "document_type": "certificate"},
+            "results": [{
+                "name": "LAD LED R500-1",
+                "primary_document": {
+                    "document_type": "certificate",
+                    "title": "Сертификат соответствия CE",
+                    "url": "https://ladzavod.ru/storage/r500-ce.pdf",
+                    "evidence": {"subtype": "CE", "scope": "LAD LED R500-1"},
+                },
+            }],
+        }
+        response = _MODULE._certificate_direct_link_response(
+            message="Нужна ссылка на CE-сертификат LAD LED R500, дай прямую ссылку.",
+            tool_name="corp_db_search",
+            tool_args={"kind": "lamp_documents_index", "document_type": "certificate", "names": ["LAD LED R500"]},
+            tool_result=_ToolResult(True, output=json.dumps(payload, ensure_ascii=False)),
+            route_hint={"route_id": "corp_db.certificate_by_lamp_name"},
+        )
+
+        self.assertIn("CE-сертификат", response)
+        self.assertIn("охват: LAD LED R500-1", response)
+        self.assertNotIn("не подтверждены", response)
+
+    def test_certificate_direct_link_marks_mismatched_document_entity(self):
+        payload = {
+            "status": "success",
+            "kind": "lamp_documents_index",
+            "filters": {"names": ["LAD LED R500"], "document_type": "certificate"},
+            "results": [{
+                "name": "LAD LED R500-1",
+                "primary_document": {
+                    "document_type": "certificate",
+                    "title": "Сертификат",
+                    "url": "https://ladzavod.ru/storage/r500.pdf",
+                },
+            }],
+        }
+        response = _MODULE._certificate_direct_link_response(
+            message="Нужна ссылка на сертификат LAD LED R500, дай прямую ссылку.",
+            tool_name="corp_db_search",
+            tool_args={"kind": "lamp_documents_index", "document_type": "certificate", "names": ["LAD LED R500"]},
+            tool_result=_ToolResult(True, output=json.dumps(payload, ensure_ascii=False)),
+            route_hint={"route_id": "corp_db.certificate_by_lamp_name"},
+        )
+
+        self.assertIn("для сущности LAD LED R500-1", response)
+        self.assertIn("охват «LAD LED R500» не подтверждён", response)
+        self.assertIn("https://ladzavod.ru/storage/r500.pdf", response)
 
     def test_route_selector_documents_fallback_stays_inside_documents_family(self):
         selector_response = {
