@@ -81,6 +81,31 @@ def check_schema_closed(routes: list[dict[str, Any]]) -> list[str]:
     return errors
 
 
+def _has_fixed_value(fixed_args: dict[str, Any], field: str) -> bool:
+    return fixed_args.get(field) not in (None, "", [], {})
+
+
+def _schema_requires_any_selector_alternative(
+    schema: dict[str, Any],
+    selector_group: set[str],
+) -> bool:
+    """Conservatively check the small required/anyOf subset supported by route schemas."""
+    required = schema.get("required") or []
+    if isinstance(required, list) and selector_group.intersection(str(field) for field in required):
+        return True
+
+    any_of = schema.get("anyOf") or []
+    if not isinstance(any_of, list) or not any_of:
+        return False
+    for branch in any_of:
+        branch_required = branch.get("required") if isinstance(branch, dict) else None
+        if not isinstance(branch_required, list) or not branch_required:
+            return False
+        if not selector_group.intersection(str(field) for field in branch_required):
+            return False
+    return True
+
+
 def check_corp_db_contract_parity(routes: list[dict[str, Any]]) -> list[str]:
     """Check selector-visible route fields against operational semantics by executor kind."""
     errors = validate_waivers(static_route_catalog_dir().parents[1])
@@ -99,12 +124,6 @@ def check_corp_db_contract_parity(routes: list[dict[str, Any]]) -> list[str]:
         schema = route.get("argument_schema") if isinstance(route.get("argument_schema"), dict) else {}
         properties = set((schema.get("properties") or {}).keys())
         required = set(schema.get("required") or [])
-        alternatives = {
-            field
-            for alternative in schema.get("anyOf") or []
-            for field in (alternative.get("required") or [])
-            if isinstance(alternative, dict)
-        }
         fixed_fields = set(template) | set(locked)
         allowed = set(contract["consumed"]) | set(contract["passthrough"])
 
@@ -135,16 +154,19 @@ def check_corp_db_contract_parity(routes: list[dict[str, Any]]) -> list[str]:
             )
 
         for group in contract["required_any_of"]:
-            if any(field in fixed_fields for field in group):
+            if any(_has_fixed_value(fixed_args, field) for field in group):
                 continue
             selector_group = set(group) & properties
-            if selector_group and not (selector_group & required) and not selector_group.issubset(alternatives):
-                waived = waiver_fields(route_id, "missing-required")
-                if not selector_group.issubset(waived):
-                    errors.append(
-                        f"{route_id}: executor requires one of ({', '.join(group)}) for kind {kind}, "
-                        "but schema does not enforce its selector-visible alternatives"
-                    )
+            waived = waiver_fields(route_id, "missing-required")
+            if (selector_group and selector_group.issubset(waived)) or (
+                not selector_group and set(group).issubset(waived)
+            ):
+                continue
+            if not selector_group or not _schema_requires_any_selector_alternative(schema, selector_group):
+                errors.append(
+                    f"{route_id}: executor requires one of ({', '.join(group)}) for kind {kind}, "
+                    "but schema does not enforce a selector-visible alternative (missing-required)"
+                )
     return errors
 
 

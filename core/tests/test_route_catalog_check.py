@@ -11,6 +11,23 @@ from documents.route_catalog_check import (
     check_sibling_fallback_coverage,
     run_checks,
 )
+from documents.route_schema import validate_tool_args
+
+
+def _mountings_route(
+    argument_schema: dict,
+    *,
+    route_id: str = "corp_db.category_mountings",
+    template: dict | None = None,
+) -> dict:
+    fixed = {"kind": "category_mountings", **(template or {})}
+    return {
+        "route_id": route_id,
+        "executor": "corp_db_search",
+        "executor_args_template": fixed,
+        "locked_args": {"kind": "category_mountings"},
+        "argument_schema": argument_schema,
+    }
 
 
 def _kb_route(route_id: str, family_id: str, *, fallback_route_ids=None, fallback_policy=None) -> dict:
@@ -65,13 +82,51 @@ class RouteCatalogCheckTests(unittest.TestCase):
         self.assertTrue(any("lamp_filters" in error and "query" in error for error in errors))
         self.assertTrue(any("catalog_lookup" in error and "name" in error for error in errors))
 
-    def test_contract_parity_accepts_narrower_selector_visible_required_any_of(self):
-        route = {
-            "route_id": "corp_db.category_mountings",
-            "executor": "corp_db_search",
-            "executor_args_template": {"kind": "category_mountings"},
-            "locked_args": {"kind": "category_mountings"},
-            "argument_schema": {
+    def test_contract_parity_rejects_missing_or_optional_executor_alternatives(self):
+        schemas = {
+            "missing": {
+                "properties": {"limit": {"type": "integer"}},
+                "required": [],
+            },
+            "visible_but_optional": {
+                "properties": {
+                    "category": {"type": "string"},
+                    "series": {"type": "string"},
+                },
+                "required": [],
+            },
+            "empty_any_of_branch": {
+                "properties": {"category": {"type": "string"}},
+                "required": [],
+                "anyOf": [{"required": ["category"]}, {}],
+            },
+            "foreign_any_of_branch": {
+                "properties": {
+                    "category": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": [],
+                "anyOf": [{"required": ["category"]}, {"required": ["limit"]}],
+            },
+        }
+
+        for case, schema in schemas.items():
+            with self.subTest(case=case):
+                errors = check_corp_db_contract_parity([_mountings_route(schema, route_id=f"test.{case}")])
+                self.assertTrue(any("missing-required" in error for error in errors), errors)
+
+        # This input is accepted by the synthetic selector schema via its unrelated branch,
+        # yet it violates category_mountings' executor contract by supplying no selector.
+        foreign_route = _mountings_route(schemas["foreign_any_of_branch"])
+        validate_tool_args(foreign_route, {"limit": 1}, require_required=True)
+
+    def test_contract_parity_accepts_satisfiable_executor_alternatives(self):
+        schemas = {
+            "required_field": {
+                "properties": {"category": {"type": "string"}},
+                "required": ["category"],
+            },
+            "narrower_category_or_series": {
                 "properties": {
                     "category": {"type": "string"},
                     "series": {"type": "string"},
@@ -82,11 +137,31 @@ class RouteCatalogCheckTests(unittest.TestCase):
                     {"required": ["series"]},
                 ],
             },
+            "mounting_compatibility": {
+                "properties": {
+                    "category": {"type": "string"},
+                    "series": {"type": "string"},
+                    "mounting_type": {"type": "string"},
+                },
+                "required": ["mounting_type"],
+                "anyOf": [
+                    {"required": ["category"]},
+                    {"required": ["series"]},
+                ],
+            },
         }
 
-        errors = check_corp_db_contract_parity([route])
+        for case, schema in schemas.items():
+            with self.subTest(case=case):
+                errors = check_corp_db_contract_parity([_mountings_route(schema, route_id=f"test.{case}")])
+                self.assertEqual(errors, [])
 
-        self.assertEqual(errors, [])
+        fixed_route = _mountings_route(
+            {"properties": {"limit": {"type": "integer"}}, "required": []},
+            route_id="test.fixed_category",
+            template={"category": "Промышленные светильники"},
+        )
+        self.assertEqual(check_corp_db_contract_parity([fixed_route]), [])
 
     def test_contract_parity_flags_locked_template_field_reexposed_to_selector(self):
         route = {
