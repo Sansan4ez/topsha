@@ -459,6 +459,8 @@ def _is_doc_domain_route(state: dict[str, Any]) -> bool:
         return True
     if str(state.get("route_source") or "") == "doc_search":
         return True
+    if str(state.get("retrieval_business_family_id") or state.get("selected_family_id") or "") == "documents":
+        return True
     return str(state.get("intent") or "") == "document_lookup"
 
 
@@ -546,7 +548,12 @@ def _route_evidence_status(
     # only one channel must stay retryable/fallback-eligible.  This check intentionally uses the
     # user request rather than keywords added to tool args, so partial/irrelevant fake payloads
     # exercise the same guard as production responses.
-    if _company_fact_intent_type(message):
+    if (
+        state.get("intent") == "company_fact"
+        and str(state.get("retrieval_business_family_id") or state.get("selected_family_id") or "") != "catalog"
+        and not _is_doc_domain_route(state)
+        and _company_fact_intent_type(message)
+    ):
         payload = _parse_json_object(tool_result.output or "")
         if payload.get("status") == "empty":
             return "empty"

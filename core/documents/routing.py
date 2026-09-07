@@ -1996,6 +1996,13 @@ def _infer_intent_family(query: str, *, explicit_document_request: bool) -> str:
         return "portfolio_lookup"
     if _is_mountings_family_query(query) or _is_structured_lamp_filter_query(query) or _is_exact_lamp_model_query(query):
         return "catalog_lookup"
+    # Structured selection cues can coexist with broad company-fact vocabulary (for example,
+    # warranty in a product-filter request). Treat an explicit catalog selection as catalog
+    # intent before the shared company-fact keyword set is considered.
+    if _intent_contains(query_text, FILTER_SELECTION_QUERY_CUES) and (
+        STRUCTURED_FILTER_MEASUREMENT_RE.search(query_text) or EXPLOSION_FILTER_RE.search(query_text)
+    ):
+        return "catalog_lookup"
     # Words such as «офис» and «склад» occur in both application requests and company
     # questions (e.g. the head-office address).  Treat a fact-shaped question as company Q&A
     # unless it also contains an explicit recommendation/selection cue; otherwise the broad

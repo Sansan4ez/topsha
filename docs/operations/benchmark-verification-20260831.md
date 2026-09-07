@@ -1,4 +1,72 @@
-# Production benchmark verification — 2026-08-31
+# Production benchmark verification — 2026-09-07
+
+## Final verification attempt (current HEAD)
+
+**Not complete — issue `totosha-3ee9.1` remains open.** The current HEAD was rebuilt and the deterministic direct-tool, Ex/2Ex incident, RFC-028 runtime, and five independent company-fact stability runs were recorded. The full production-agent gate remained below 100%: the final full replay reached 23/26, with `sales-001-certificates-links`, `tech-034-lamp-filters-category-fallback`, and `tech-036-application-street-pole-lighting` failing answer checks. An earlier final replay reached 25/26 and exposed `tech-016-retrieval-r500-12-by-power-voltage`; subsequent focused reruns passed that case, confirming runtime answer instability rather than a reason to weaken the golden checks. The strict golden assertions were not relaxed. The focused source regression suite passed after narrow routing-state fixes; remaining production-agent failures are tracked in follow-up `totosha-d6er`.
+
+### Current deployment metadata
+
+| Item | Value |
+|---|---|
+| Source SHA before final rebuild | `a89397826c7a498df6c2d8d0f6f65b5c563aecb1` |
+| Source dirty status before final rebuild | `.beads/issues.jsonl` was dirty from the required issue claim; code was clean |
+| Final core image | `sha256:ce8e41915f27586b774713c00d21a08c5aabe3118a813e7d004ce9bc051206fb` |
+| Final tools-api image | `sha256:76dee7771fcd5b0caa558f870a940c462c193ca1fda7c98de7a25c4a784bf65a` |
+| Core build metadata | `git_sha=a89397826c7a498df6c2d8d0f6f65b5c563aecb1-dirty`, `build_time=2026-09-07T05:35:17Z` |
+| tools-api build metadata | `git_sha=a89397826c7a498df6c2d8d0f6f65b5c563aecb1-dirty`, `build_time=2026-09-07T05:35:17Z` |
+| Effective configured model | `gpt-5.6-terra` from `workspace/_shared/admin_config.json` |
+| Provider-reported model | `gpt-5.6-terra` |
+| Dataset revisions | `v1=0af31ec8dcbdbf13be26b71db3006bce765ec905`, `incident-ex-2ex=b068d714bdd8aba9ae888c4f64ecce2176d6db6c`, `incident-pfit7=1163ccc4368990b8438d578e26b4be3eec460e66`, `rfc028=a0a1a8b1d3371199ce91248a23f60e05d5b96719`, `prod-agent=9f713789cbb97938e3cb17726d2b1dff4a87d894` |
+
+Rebuild command:
+
+```bash
+SHA=$(git rev-parse HEAD)
+BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+BUILD_GIT_SHA="$SHA" BUILD_TIME="$BUILD_TIME" docker compose build core tools-api
+BUILD_GIT_SHA="$SHA" BUILD_TIME="$BUILD_TIME" docker compose up -d --no-deps core tools-api
+```
+
+Health endpoints reported `status=ok`, routing catalog `valid=true`, route count 24, and RFC-026 database objects applied.
+
+### Final gate results
+
+| Gate | Result | Latency avg / p50 / p95 | Tokens | Estimated cost |
+|---|---:|---:|---:|---:|
+| Direct-tool v1 (47 direct-tool cases) | **47/47** | 250.490 / 122.315 / 733.271 ms | 0 | $0 |
+| Ex/2Ex direct-tool | **6/6** | 259.031 / 165.690 / 496.522 ms | 0 | $0 |
+| Ex/2Ex runtime incident smoke | **6/6**, doctor required checks 3/3 | 272.053 / 148.198 / 728.376 ms | 0 | $0 |
+| RFC-028 runtime routing | **22/22** | 11,433.982 / 9,470.102 / 18,761.378 ms | 173,586 total | $0.4966275 |
+| Company facts, independent clean-session runs | **5/5 each run** across 5 runs | avg 9,482.350–10,729.478 ms | 41,234–41,445 total/run | $0.087319–$0.1223725/run |
+| Full prod-agent-v1 runtime (final full replay) | **23/26 (88.46%)** | 11,515.298 / 10,434.137 / 16,769.125 ms | 237,057 total | $0.6293305 |
+
+The full prod-agent failure request IDs were:
+
+- `bench/20260907_054314Z_bf6194/sales-001-certificates-links` — final answer omitted the required per-entity URL pairs.
+- `bench/20260907_054314Z_bf6194/tech-034-lamp-filters-category-fallback` — final answer omitted `R320`; a direct tools-api replay returned `category_filter_dropped=true` and R320 results.
+- `bench/20260907_054314Z_bf6194/tech-036-application-street-pole-lighting` — final answer omitted the required height/pole evidence.
+- Earlier `bench/20260907_052848Z_94a4c9/tech-016-retrieval-r500-12-by-power-voltage` returned the bounded no-result answer despite a verified tool match; focused reruns later passed it.
+
+Selection accuracy for the final full production-agent run was **26/26**; effective execution assertions were **2/2**; answer correctness was **23/26**. This distinguishes selector success from answer/evidence correctness. Follow-up: `totosha-d6er`.
+
+### Focused verification and environment warnings
+
+Commands run included:
+
+```bash
+docker run --rm --entrypoint python -e PYTHONPATH=/repo -v "$PWD:/repo:ro" -w /repo totosha-core -m pytest -q core/tests --ignore=core/tests/test_sandbox.py
+python3 bench/bench_run.py --docker-exec --dataset bench/golden/incident-ex-2ex-20260827.jsonl --timeout-s 180 --out ...
+python3 bench/bench_run.py --docker-exec --dataset bench/golden/rfc028-routing-baseline.jsonl --force-agent-chat --chat-execution-mode runtime --expected-configured-model gpt-5.6-terra --expected-llm-model gpt-5.6-terra --timeout-s 180 --out ...
+python3 scripts/incident_replay_smoke.py --docker-exec --timeout-s 180 --json
+python3 scripts/doctor.py --json
+```
+
+Focused Core suite: **346 passed, 5 skipped**. The full Core pytest excluding sandbox tests passed. The tools-api image test run passed **71 tests with 1 pre-existing fixture failure** (`ToolsApiCorrelationTests.test_route_updates_correlation_context_with_tool_call_headers`, dummy connection lacks `fetchrow` for the embedding-coverage probe); the production `/health` and live tool calls were healthy.
+
+Security doctor: **73/74**, with the known medium environment warning `perm_docker-compose.yml` (`docker-compose.yml` mode `0o664`, expected `0o644`). No benchmark assertions or golden facts/routes/tool args were changed to hide failures.
+
+The original 2026-08-31 evidence follows for historical comparison; its rebuilt SHA `10bd54e` is not evidence for current HEAD.
+
 
 ## Outcome
 
