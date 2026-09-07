@@ -1101,9 +1101,9 @@ def _certificate_direct_link_response(
     declared_names = [str(name).strip() for name in declared_names if str(name).strip()]
     if (
         not declared_names
-        or len({name.casefold() for name in declared_names}) != len(declared_names)
-        or [_normalize_document_series_name(name) for name in declared_names]
-        != [_normalize_document_series_name(name) for name in requested_names]
+        or len({_normalize_document_series_name(name) for name in declared_names}) != len(declared_names)
+        or {_normalize_document_series_name(name) for name in declared_names}
+        != {_normalize_document_series_name(name) for name in requested_names}
     ):
         return ""
 
@@ -1124,25 +1124,35 @@ def _certificate_direct_link_response(
     for requested_name in requested_names:
         normalized_name = _normalize_document_series_name(requested_name)
         exact_matches: list[tuple[str, str, str, str, str]] = []
+        prefix_matches: list[tuple[str, str, str, str, str]] = []
         for row in rows:
             row_name = _normalize_document_series_name(row.get("name"))
-            # Prefix matches resolve a series to one SKU but do not prove that the document
-            # applies to the whole series.  They therefore stay in the scoped finalizer.
-            if row_name != normalized_name:
+            is_exact = row_name == normalized_name
+            is_prefix = row_name.startswith(f"{normalized_name}-") or row_name.startswith(f"{normalized_name} ")
+            if not (is_exact or is_prefix):
                 continue
             primary = row.get("primary_document") if isinstance(row.get("primary_document"), dict) else {}
             if str(primary.get("document_type") or "") != "certificate":
                 continue
             url = str(primary.get("url") or "").strip()
-            if url:
+            if url and URL_RE.match(url):
                 title = str(primary.get("title") or "Сертификат").strip() or "Сертификат"
                 subtype, scope = _certificate_evidence_details(primary)
-                exact_matches.append((str(row.get("name") or requested_name).strip(), title, url, subtype, scope))
-        # Zero rows means missing; multiple rows mean ambiguous identity. Both cases need the
-        # scoped finalizer, which can state the limitation without claiming a deterministic link.
-        if len(exact_matches) != 1:
+                match = (str(row.get("name") or requested_name).strip(), title, url, subtype, scope)
+                (exact_matches if is_exact else prefix_matches).append(match)
+        if exact_matches:
+            # Multiple exact rows make the entity-to-document association ambiguous.
+            if len(exact_matches) != 1:
+                return ""
+            selected_match = exact_matches[0]
+        elif prefix_matches:
+            # Series lookups intentionally return a deterministic, source-ordered representative
+            # modification. The response names that concrete entity and explicitly says that
+            # neither subtype nor series-wide coverage is proven.
+            selected_match = prefix_matches[0]
+        else:
             return ""
-        direct_links.append((requested_name, *exact_matches[0]))
+        direct_links.append((requested_name, *selected_match))
 
     requested_subtypes: list[str] = []
     if "ce" in message_text:
@@ -1155,7 +1165,10 @@ def _certificate_direct_link_response(
     for requested_name, actual_name, title, url, subtype, scope in direct_links:
         label = _certificate_subtype_label(subtype)
         scope_suffix = f"; охват: {scope}" if scope else ""
-        lines.append(f"- {label} «{title}» для сущности {actual_name}{scope_suffix}: {url}")
+        lines.append(
+            f"- По запросу {requested_name}: {label} «{title}» "
+            f"для сущности {actual_name}{scope_suffix}: {url}"
+        )
         scope_matches_request = bool(scope) and _normalize_document_series_name(scope) == _normalize_document_series_name(requested_name)
         entity_matches_request = actual_name.casefold() == requested_name.casefold()
         if requested_subtype and not subtype:
@@ -1221,6 +1234,34 @@ async def _finalize_or_fail_closed(
         return _finalizer_unavailable_response(routing_state, error=exc)
 
     if str(final_response or "").strip():
+        if (
+            tool_name == "corp_db_search"
+            and str(tool_args.get("kind") or "") == "application_recommendation"
+            and str((route_hint or {}).get("route_id") or "") == "corp_db.application_recommendation"
+        ):
+            payload = _parse_json_object(tool_result.output or "")
+            if payload.get("status") == "success":
+                portfolio_rows = _bounded_application_portfolio_rows(payload)
+                lamps = payload.get("recommended_lamps") if isinstance(payload.get("recommended_lamps"), list) else []
+                lamp_urls = [
+                    str(row.get("url") or "").strip()
+                    for row in lamps
+                    if isinstance(row, dict) and str(row.get("url") or "").strip()
+                ]
+                # A recommendation without any retrieved product link loses the executor's
+                # central evidence. Fall back to the bounded renderer over the same payload.
+                if portfolio_rows is not None and lamp_urls and not any(url in final_response for url in lamp_urls):
+                    rendered = _render_application_payload(payload, portfolio_rows=portfolio_rows)
+                    if rendered:
+                        routing_state["finalizer_mode"] = "deterministic_application_recovery"
+                        _update_routing_observability(routing_state)
+                        return rendered
+                # Keep the executor's bounded follow-up question as part of the answer contract.
+                # The LLM may ask a useful but different question; appending the source question
+                # preserves installation constraints without discarding its prose.
+                follow_up = str(payload.get("follow_up_question") or "").strip()
+                if follow_up and _normalize_routing_text(follow_up) not in _normalize_routing_text(final_response):
+                    final_response = f"{final_response.rstrip()}\n\n{follow_up}"
         # The retrieval gate proves that the payload answers this company fact, but an external
         # finalizer can still omit or contradict it.  Recover from the same validated evidence
         # deterministically rather than returning a fluent "not found" answer.  This is a bounded
@@ -3489,6 +3530,41 @@ def _normalize_lamp_filter_series_arguments(
     return normalized_args, "not_applicable", ""
 
 
+SIMPLE_SUPPLY_VOLTAGE_RE = re.compile(
+    r"^\s*(?P<value>\d+(?:[.,]\d+)?)\s*(?:в|v|вольт(?:а|ов)?)\s*$",
+    re.IGNORECASE,
+)
+VOLTAGE_RANGE_ARGUMENT_KEYS = (
+    "voltage_nominal_v_min",
+    "voltage_nominal_v_max",
+    "voltage_min_v_min",
+    "voltage_min_v_max",
+    "voltage_max_v_min",
+    "voltage_max_v_max",
+)
+
+
+def _drop_redundant_supply_voltage_raw(tool_args: dict[str, Any]) -> dict[str, Any]:
+    """Prefer typed voltage constraints over a duplicate plain-text number.
+
+    A builder can emit both ``supply_voltage_raw='230 В'`` and exact nominal bounds.  The raw
+    text filter is a literal substring contract (catalog values are commonly ``AC230``), so
+    applying both turns a valid typed query into an empty result.  Preserve richer raw values
+    such as ``AC/DC 230``; only remove a simple number+unit duplicate.
+    """
+    normalized = dict(tool_args)
+    raw = str(normalized.get("supply_voltage_raw") or "").strip()
+    match = SIMPLE_SUPPLY_VOLTAGE_RE.fullmatch(raw) if raw else None
+    if match:
+        value = float(match.group("value").replace(",", "."))
+        value = int(value) if value.is_integer() else value
+        if not any(normalized.get(key) is not None for key in VOLTAGE_RANGE_ARGUMENT_KEYS):
+            normalized["voltage_nominal_v_min"] = value
+            normalized["voltage_nominal_v_max"] = value
+        normalized.pop("supply_voltage_raw", None)
+    return normalized
+
+
 def _normalize_route_argument_builder_content(
     content: str,
     route: dict[str, Any],
@@ -3511,6 +3587,7 @@ def _normalize_route_argument_builder_content(
         "fallback_route_ids",
     }
     target = parsed["tool_args"] if wrapped else parsed
+    target = _drop_redundant_supply_voltage_raw(target)
     normalized_args, outcome, canonical_series = _normalize_lamp_filter_series_arguments(query, target)
     if wrapped:
         parsed = dict(parsed)
@@ -3917,6 +3994,13 @@ async def _select_route_with_llm(
         if isinstance(selector_output, dict) and isinstance(selector_output.get("tool_args"), dict)
         else {}
     )
+    if str(choice_route.get("route_id") or "") == "corp_db.certificate_by_lamp_name":
+        # Call A intentionally has no argument schema, so it normally cannot declare names.
+        # Reuse the reviewed canonical-series resolver as the independent request coverage set;
+        # do not add a second free-form entity parser for the certificate shortcut.
+        declared_series = explicit_series_alias_candidates(routing_message)
+        if declared_series:
+            selector_declared_tool_args["names"] = declared_series
 
     # RFC-029 workstream 2, Call B: argument construction against only the selected route's
     # own JSON Schema. Skipped entirely for fully locked/templated routes. A schema violation

@@ -910,6 +910,48 @@ class RoutingGuardrailTests(unittest.TestCase):
         self.assertIn("охват: LAD LED R500", response)
         self.assertNotIn("не подтверждены", response)
 
+    def test_certificate_direct_link_renders_representative_series_links_with_scope_limitations(self):
+        requested_urls = {
+            "LAD LED R500": ("LAD LED R500-10-10-6-500L", "https://ladzavod.ru/storage/r500.pdf"),
+            "LAD LED LINE": ("LAD LED LINE-1000-10-40B", "https://ladzavod.ru/storage/line.pdf"),
+            "LAD LED R700": ("LAD LED R700-10-PC-10-750-D48-1000L1 ST", "https://ladzavod.ru/storage/r700.pdf"),
+        }
+        payload = {
+            "status": "success",
+            "kind": "lamp_documents_index",
+            "filters": {"names": list(requested_urls), "document_type": "certificate"},
+            "results": [
+                {
+                    "name": actual_name,
+                    "primary_document": {
+                        "document_type": "certificate",
+                        "title": "Сертификат",
+                        "url": url,
+                    },
+                }
+                for actual_name, url in requested_urls.values()
+            ],
+        }
+
+        response = _MODULE._certificate_direct_link_response(
+            message="Дай CE и пожарные сертификаты для LAD LED R500, LAD LED LINE и LAD LED R700 ссылками.",
+            tool_name="corp_db_search",
+            tool_args={"kind": "lamp_documents_index", "document_type": "certificate", "names": list(requested_urls)},
+            tool_result=_ToolResult(True, output=json.dumps(payload, ensure_ascii=False)),
+            route_hint={
+                "route_id": "corp_db.certificate_by_lamp_name",
+                "selector_declared_tool_args": {"names": list(requested_urls)},
+            },
+        )
+
+        for requested_name, (actual_name, url) in requested_urls.items():
+            self.assertIn(requested_name, response)
+            self.assertIn(actual_name, response)
+            self.assertIn(url, response)
+        self.assertNotIn("CE-сертификат", response)
+        self.assertNotIn("Пожарный сертификат", response)
+        self.assertEqual(response.count("не подтверждены"), 3)
+
     def test_certificate_direct_link_marks_mismatched_document_entity(self):
         payload = {
             "status": "success",
@@ -935,9 +977,11 @@ class RoutingGuardrailTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(response, "")
+        self.assertIn("LAD LED R500-1", response)
+        self.assertIn("https://ladzavod.ru/storage/r500.pdf", response)
+        self.assertIn("охват «LAD LED R500» не подтверждён", response)
 
-    def test_certificate_direct_link_fails_closed_for_prefix_only_series_resolution(self):
+    def test_certificate_direct_link_uses_first_source_ordered_prefix_result_without_claiming_series_scope(self):
         payload = {
             "status": "success",
             "kind": "lamp_documents_index",
@@ -961,7 +1005,9 @@ class RoutingGuardrailTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(response, "")
+        self.assertIn("LAD LED R500-1", response)
+        self.assertIn("https://ladzavod.ru/storage/r500.pdf", response)
+        self.assertIn("охват «LAD LED R500» не подтверждён", response)
 
     def test_certificate_finalizer_receives_requested_found_missing_when_builder_drops_name(self):
         payload = {
@@ -2636,6 +2682,65 @@ class RoutingGuardrailTests(unittest.TestCase):
         self.assertEqual(exec_mock.await_count, 1)
         self.assertEqual(meta["retrieval_selected_source"], "corp_db")
         self.assertEqual(meta["application_recovery_outcome"], "")
+
+    def test_application_finalizer_appends_executor_follow_up_constraint(self):
+        payload = {
+            "status": "success",
+            "resolved_application": {
+                "application_key": "street_road_lighting",
+                "sphere_name": "Уличное освещение",
+            },
+            "recommended_lamps": [
+                {"name": "LAD LED R700", "url": "https://ladzavod.ru/catalog/r700"}
+            ],
+            "follow_up_question": "Уточните высоту опоры и тип территории.",
+        }
+        routing_state = {"user_message": "Подбери светильник на столб 4 метра.", "finalizer_mode": "llm"}
+        finalizer = AsyncMock(
+            return_value=self._final_response(
+                "Подойдёт LAD LED R700: https://ladzavod.ru/catalog/r700. "
+                "Уточните, нужно освещать дорогу или парковку?"
+            )
+        )
+        with patch.object(_MODULE, "call_llm", finalizer):
+            response = asyncio.run(_MODULE._finalize_or_fail_closed(
+                base_messages=[],
+                tool_name="corp_db_search",
+                tool_args={"kind": "application_recommendation"},
+                tool_result=_ToolResult(True, output=json.dumps(payload, ensure_ascii=False)),
+                route_hint={"route_id": "corp_db.application_recommendation"},
+                routing_state=routing_state,
+            ))
+
+        self.assertIn("https://ladzavod.ru/catalog/r700", response)
+        self.assertIn("Уточните высоту опоры", response)
+        self.assertEqual(routing_state["finalizer_mode"], "llm")
+
+    def test_application_finalizer_recovers_when_all_lamp_links_are_omitted(self):
+        payload = {
+            "status": "success",
+            "resolved_application": {"sphere_name": "Уличное освещение"},
+            "recommended_lamps": [
+                {"name": "LAD LED R700", "url": "https://ladzavod.ru/catalog/r700"}
+            ],
+            "portfolio_examples": [],
+            "follow_up_question": "Уточните высоту опоры.",
+        }
+        routing_state = {"user_message": "Подбери уличный светильник.", "finalizer_mode": "llm"}
+        finalizer = AsyncMock(return_value=self._final_response("Подойдёт серия LAD LED R700."))
+        with patch.object(_MODULE, "call_llm", finalizer):
+            response = asyncio.run(_MODULE._finalize_or_fail_closed(
+                base_messages=[],
+                tool_name="corp_db_search",
+                tool_args={"kind": "application_recommendation"},
+                tool_result=_ToolResult(True, output=json.dumps(payload, ensure_ascii=False)),
+                route_hint={"route_id": "corp_db.application_recommendation"},
+                routing_state=routing_state,
+            ))
+
+        self.assertIn("https://ladzavod.ru/catalog/r700", response)
+        self.assertIn("Уточните высоту опоры", response)
+        self.assertEqual(routing_state["finalizer_mode"], "deterministic_application_recovery")
 
     def test_application_portfolio_rows_are_bounded_and_preserve_source_order(self):
         payload = {

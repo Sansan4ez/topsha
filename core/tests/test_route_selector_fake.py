@@ -444,6 +444,79 @@ class RouteSelectorFakeTests(unittest.TestCase):
                 )
                 self.assertIn("corp_db.lamp_filters", selector_text)
 
+    def test_certificate_route_uses_canonical_series_mentions_as_coverage_contract(self):
+        fake = ScriptedRouteSelectorLLM(
+            [
+                _choice("corp_db.certificate_by_lamp_name"),
+                _arguments({"names": ["LAD LED R500", "LAD LED LINE", "LAD LED R700"]}),
+            ]
+        )
+
+        _selection, route_hint, _secondary = self._run(
+            "Дай ссылки на сертификаты LAD LED R500, LAD LED LINE и LAD LED R700.", fake
+        )
+
+        self.assertEqual(
+            set(route_hint["selector_declared_tool_args"]["names"]),
+            {"LAD LED R500", "LAD LED LINE", "LAD LED R700"},
+        )
+
+    def test_lamp_filter_drops_plain_raw_voltage_when_typed_bounds_are_present(self):
+        fake = ScriptedRouteSelectorLLM(
+            [
+                _choice("corp_db.lamp_filters"),
+                _arguments(
+                    {
+                        "supply_voltage_raw": "230 В",
+                        "voltage_nominal_v_min": 230,
+                        "voltage_nominal_v_max": 230,
+                        "power_w_min": 35,
+                        "power_w_max": 35,
+                    }
+                ),
+            ]
+        )
+
+        _selection, route_hint, _secondary = self._run(
+            "Подбери светильник 35 Вт на 230 В.", fake
+        )
+
+        self.assertNotIn("supply_voltage_raw", route_hint["tool_args"])
+        self.assertEqual(route_hint["tool_args"]["voltage_nominal_v_min"], 230)
+        self.assertEqual(route_hint["tool_args"]["voltage_nominal_v_max"], 230)
+
+    def test_lamp_filter_converts_plain_raw_voltage_to_typed_bounds(self):
+        fake = ScriptedRouteSelectorLLM(
+            [
+                _choice("corp_db.lamp_filters"),
+                _arguments({"supply_voltage_raw": "230 В", "power_w_min": 35}),
+            ]
+        )
+
+        _selection, route_hint, _secondary = self._run("Нужен светильник 35 Вт на 230 В.", fake)
+
+        self.assertNotIn("supply_voltage_raw", route_hint["tool_args"])
+        self.assertEqual(route_hint["tool_args"]["voltage_nominal_v_min"], 230)
+        self.assertEqual(route_hint["tool_args"]["voltage_nominal_v_max"], 230)
+
+    def test_lamp_filter_keeps_richer_raw_voltage_with_typed_bounds(self):
+        fake = ScriptedRouteSelectorLLM(
+            [
+                _choice("corp_db.lamp_filters"),
+                _arguments(
+                    {
+                        "supply_voltage_raw": "AC/DC 230",
+                        "voltage_nominal_v_min": 230,
+                        "voltage_nominal_v_max": 230,
+                    }
+                ),
+            ]
+        )
+
+        _selection, route_hint, _secondary = self._run("Нужен AC/DC 230 В.", fake)
+
+        self.assertEqual(route_hint["tool_args"]["supply_voltage_raw"], "AC/DC 230")
+
     def test_lamp_filter_explicit_alias_conflict_repairs_locally(self):
         fake = ScriptedRouteSelectorLLM(
             [
