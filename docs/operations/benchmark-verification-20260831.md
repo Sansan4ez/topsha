@@ -1,6 +1,119 @@
 # Production benchmark verification — 2026-09-07
 
-## Final verification attempt (current HEAD)
+## Completed verification gate — implementation SHA `8b509b5`
+
+**Complete — all acceptance gates passed.** Issue `totosha-3ee9.1` was verified against clean implementation SHA `8b509b585cc291bae319f18d1d7cc65a0b97174d`. Core and tools-api were rebuilt from that SHA, both `/health` endpoints reported the same SHA, and the configured plus provider-reported runtime model was `gpt-5.6-terra` for every RFC-028, company-fact, and production-agent result row. No golden fact, route, tool-argument, effective-execution, or answer/evidence assertion was weakened.
+
+The closing commit changes only this report and Beads state; the runtime implementation verified below remains `8b509b5`. Raw local artifacts are under ignored directory `bench/results/verification-20260907-final4/`.
+
+### Verified source and deployment
+
+| Item | Value |
+|---|---|
+| Implementation SHA rebuilt and exercised | `8b509b585cc291bae319f18d1d7cc65a0b97174d` |
+| Source status before rebuild | clean (`git status --porcelain` empty) |
+| Build time | `2026-09-07T17:02:17Z` |
+| Core image/container ID | `sha256:e0eb07f494fd490fe2248d9eaf5f0595c2a80ded82caf21c8ecefb741f68b449` |
+| tools-api image/container ID | `sha256:c3cf162dc0d4dbd41249bc26e6d44b7dd2bd0de3713be3dfb5632763486baccc` |
+| Core health | `status=ok`, `git_sha=8b509b5...`, route selector enabled, routing catalog valid, 24 routes |
+| tools-api health | `status=ok`, `git_sha=8b509b5...`, RFC-026 database objects applied |
+| Effective configured model | `gpt-5.6-terra` from `workspace/_shared/admin_config.json` |
+| Provider-reported model | `gpt-5.6-terra` on all 73 production-runtime rows (22 RFC-028 + 25 company-fact + 26 prod-agent) |
+| Dataset revisions | `v1=0af31ec8dcbdbf13be26b71db3006bce765ec905`, `incident-ex-2ex=b068d714bdd8aba9ae888c4f64ecce2176d6db6c`, `incident-pfit7=1163ccc4368990b8438d578e26b4be3eec460e66`, `rfc028=a0a1a8b1d3371199ce91248a23f60e05d5b96719`, `prod-agent=9f713789cbb97938e3cb17726d2b1dff4a87d894` |
+
+Rebuild and provenance commands:
+
+```bash
+SHA=$(git rev-parse HEAD)
+test -z "$(git status --porcelain)"
+BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+BUILD_GIT_SHA="$SHA" BUILD_TIME="$BUILD_TIME" docker compose build core tools-api
+BUILD_GIT_SHA="$SHA" BUILD_TIME="$BUILD_TIME" docker compose up -d --no-deps core tools-api
+docker exec core curl -sS http://localhost:4000/health
+docker exec tools-api curl -sS http://localhost:8100/health
+```
+
+### Fast unit, contract, and service suites
+
+| Suite | Result |
+|---|---:|
+| Full Core pytest excluding Docker sandbox tests | **355 passed, 5 skipped**; 186 subtests passed |
+| Bench and scripts unit tests | **58 passed** |
+| tools-api pytest | **72 passed** |
+| Security doctor | **73/74**; 0 critical, 0 high failures |
+
+Commands:
+
+```bash
+docker run --rm --entrypoint python -e PYTHONPATH=/repo \
+  -v "$PWD:/repo:ro" -w /repo totosha-core \
+  -m pytest -q core/tests --ignore=core/tests/test_sandbox.py
+
+python3 -m unittest -q \
+  bench.tests.test_algorithmic_eval bench.tests.test_compare \
+  bench.tests.test_routing_accuracy_summary bench.tests.test_routing_eval \
+  bench.tests.test_run_modes scripts.tests.test_admin_auth \
+  scripts.tests.test_asr_compat_smoke scripts.tests.test_corp_db_lamp_filters_latency \
+  scripts.tests.test_doctor scripts.tests.test_incident_replay_smoke
+
+# Same dependency set as the production tools-api image, then:
+PYTHONPATH=/repo/tools-api pytest -q tools-api/tests
+python3 scripts/doctor.py --json
+```
+
+The earlier tools-api fixture-only failure was resolved without changing production behavior: its fake executor now uses the production `_success(...)` response builder and its dummy OpenTelemetry object exposes `get_current_span`. Mandatory executor filter-evidence validation remains fail-closed. The sole doctor finding is the known environment-hygiene warning `perm_docker-compose.yml`: mode `0o664`, expected `0o644`.
+
+### Deterministic, incident, and production runtime gates
+
+| Gate | Result | Selection | Effective execution | Answer/evidence | Latency avg / p50 / p95 | Tokens | Cost |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Direct-tool `v1.jsonl` | **50/50** | 50/50 | 0 asserted | 3/3 asserted | 981.547 / 115.572 / 4,399.060 ms | 18,428 | $0.0575575 |
+| Ex/2Ex direct-tool | **6/6** | 6/6 | 0 asserted | 0 asserted | 500.515 / 193.386 / 1,560.187 ms | 0 | $0 |
+| Ex/2Ex incident replay smoke | **6/6**; no doctor or chat-route errors | 6/6 | 0 asserted | 0 asserted | 118.573 / 120.989 / 127.441 ms | 0 | $0 |
+| RFC-028 runtime routing | **22/22** | 22/22 | 0 asserted | routing-only | 10,152.115 / 11,569.628 / 16,027.743 ms | 162,364 + 5,383 = 167,747 | $0.486655 |
+| Company facts, five predetermined independent runs | **5/5 in every run** | 5/5 each | 0 asserted | 5/5 each | see below | see below | see below |
+| Full `prod-agent-v1` runtime | **26/26** | 26/26 | **2/2** | **26/26** | 14,429.876 / 11,757.175 / 23,328.497 ms | 228,180 + 8,572 = 236,752 | $0.694998 |
+
+Production commands:
+
+```bash
+python3 bench/bench_run.py --docker-exec \
+  --dataset bench/golden/rfc028-routing-baseline.jsonl \
+  --force-agent-chat --chat-execution-mode runtime \
+  --expected-configured-model gpt-5.6-terra \
+  --expected-llm-model gpt-5.6-terra --timeout-s 180 --out ...
+
+# Run five times over the predetermined mk-001/mk-002/mk-003/mk-007/mk-008 subset;
+# every bench_run creates an independent run/session. No retry was selected or discarded.
+python3 bench/bench_run.py --docker-exec --dataset /tmp/company-facts-final4.jsonl \
+  --chat-execution-mode runtime \
+  --expected-configured-model gpt-5.6-terra \
+  --expected-llm-model gpt-5.6-terra --timeout-s 180 --out ...
+
+python3 bench/bench_run.py --docker-exec \
+  --dataset bench/golden/prod-agent-v1.jsonl \
+  --chat-execution-mode runtime \
+  --expected-configured-model gpt-5.6-terra \
+  --expected-llm-model gpt-5.6-terra --timeout-s 180 --out ...
+```
+
+Company-fact stability details:
+
+| Run | Result | Latency avg / p50 / p95 | Prompt / completion / total tokens | Cost |
+|---:|---:|---:|---:|---:|
+| 1 | **5/5** | 12,389.567 / 8,129.079 / 24,343.580 ms | 33,866 / 1,379 / 35,245 | $0.10535 |
+| 2 | **5/5** | 10,276.388 / 9,178.659 / 15,893.441 ms | 33,907 / 1,205 / 35,112 | $0.1028425 |
+| 3 | **5/5** | 11,331.454 / 12,127.461 / 13,043.319 ms | 33,860 / 1,432 / 35,292 | $0.10613 |
+| 4 | **5/5** | 11,792.270 / 9,697.578 / 16,916.268 ms | 33,874 / 1,373 / 35,247 | $0.10528 |
+| 5 | **5/5** | 11,001.679 / 11,217.056 / 15,198.663 ms | 33,876 / 1,346 / 35,222 | $0.10488 |
+
+The full production run had no failure request IDs. Route accuracy was 26/26 across application, catalog, document, company, portfolio, series, certificate, passport, and SKU cases. The exact configured/provider model assertions passed on every row. Golden files were unchanged across the remediation commits (`git diff 882387d..8b509b5 -- bench/golden` was empty).
+
+### Decision
+
+Close `totosha-3ee9.1`: all deterministic, incident, routing, stability, and production-agent acceptance gates reached 100% on the rebuilt clean implementation SHA. Keep the parent epic open for operator review; no push or production rollout is performed by this verification step.
+
+## Previous incomplete verification attempt (historical evidence)
 
 **Not complete — issue `totosha-3ee9.1` remains open.** The current HEAD was rebuilt and the deterministic direct-tool, Ex/2Ex incident, RFC-028 runtime, and five independent company-fact stability runs were recorded. The full production-agent gate remained below 100%: the final full replay reached 23/26, with `sales-001-certificates-links`, `tech-034-lamp-filters-category-fallback`, and `tech-036-application-street-pole-lighting` failing answer checks. An earlier final replay reached 25/26 and exposed `tech-016-retrieval-r500-12-by-power-voltage`; subsequent focused reruns passed that case, confirming runtime answer instability rather than a reason to weaken the golden checks. The strict golden assertions were not relaxed. The focused source regression suite passed after narrow routing-state fixes; remaining production-agent failures are tracked in follow-up `totosha-d6er`.
 
