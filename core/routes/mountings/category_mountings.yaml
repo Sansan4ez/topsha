@@ -4,7 +4,11 @@ route_kind: corp_table
 authority: primary
 title: Category mounting options
 summary: Structured route for enumerating mounting types available for a product category or series.
-when_to_use: Select when the user asks which/what mounting types fit or are available for a product category or series, without naming a specific mounting type to validate. Questions such as "Какое крепление подходит для серии?" belong here.
+when_to_use: >-
+  Select only when the user asks which/what mounting types fit or are available for a product category or
+  series, without naming a specific mounting type to validate. Questions such as "Какое крепление подходит
+  для серии?" belong here. Do not use merely because a mounting token is present when the user is selecting
+  lamps by power, IP, or another structured constraint.
 schema_ref: category_mountings.schema.json
 topics:
 - catalog

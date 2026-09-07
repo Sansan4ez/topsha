@@ -31,7 +31,7 @@ from .routing_policy import (
     CATALOG_COMPANY_FACT_KEYWORDS as COMPANY_FACT_KEYWORDS,
     CATALOG_PORTFOLIO_LOOKUP_KEYWORDS as PORTFOLIO_LOOKUP_KEYWORDS,
 )
-from .series_catalog import canonical_series_names
+from .series_catalog import canonical_series_names, resolve_explicit_series_alias
 from .storage import ensure_document_layout, get_document_paths, iter_live_documents
 
 _logger = logging.getLogger(__name__)
@@ -230,6 +230,38 @@ MOUNTING_QUERY_CUES = (
     "совместим",
     "совместимость",
 )
+MOUNTING_OPTIONS_QUERY_CUES = (
+    "какие креплен",
+    "какое креплен",
+    "какой монтаж",
+    "вариант",
+    "типы креплен",
+    "крепления доступны",
+    "крепление доступно",
+    "крепление подходит",
+)
+FILTER_SELECTION_QUERY_CUES = (
+    "подбери",
+    "подобрать",
+    "найди",
+    "нужен",
+    "нужны",
+    "покажи модели",
+    "какие модели",
+    "какие серии",
+)
+GENERIC_RECOMMENDATION_CUES = {
+    "подбери",
+    "рекоменд",
+    "подходит",
+    "подходят",
+}
+STRUCTURED_FILTER_MEASUREMENT_RE = re.compile(
+    r"(?:\bip[\s-]?\d{2,3}\b|\b\d{1,6}(?:[.,]\d+)?\s*(?:ватт|вт|w|lm|лм|кельвин|мм|см|кг)\b|\b\d{4,5}\s*[kк]\b)",
+    re.IGNORECASE,
+)
+EXPLOSION_FILTER_RE = re.compile(r"(?:\b2\s*ex\b|\bex\b|взрывозащищ)", re.IGNORECASE)
+EXACT_LAMP_MODEL_RE = re.compile(r"\blad\s+led\s+[a-zа-я0-9]+(?:-[a-zа-я0-9/+]+){2,}", re.IGNORECASE)
 ROUTE_MATCH_STOPWORDS = {
     "и",
     "в",
@@ -1624,11 +1656,12 @@ def _is_sphere_category_query(query: str) -> bool:
     return _intent_contains(query_text, APPLICATION_RECOMMENDATION_KEYWORDS)
 
 
-def _is_series_or_category_mounting_query(query: str) -> bool:
+def _has_series_or_category_context(query: str) -> bool:
     query_text = _normalize(query)
-    if not _intent_contains(query_text, MOUNTING_QUERY_CUES):
-        return False
-    return any(marker in query_text for marker in ("сер", "категор", "линейк", "модел"))
+    return (
+        any(marker in query_text for marker in ("сер", "категор", "линейк", "модел"))
+        or _distinct_series_mentions(query) > 0
+    )
 
 
 def _mentions_specific_mounting_type(query: str) -> bool:
@@ -1646,16 +1679,77 @@ def _is_mounting_compatibility_query(query: str) -> bool:
         marker in query_text
         for marker in ("совместим", "совместимость", "подходит", "подойдут", "подойдёт", "подойдет")
     )
-    return compatibility_wording and _mentions_specific_mounting_type(query)
+    return (
+        compatibility_wording
+        and _mentions_specific_mounting_type(query)
+        and _has_series_or_category_context(query)
+    )
+
+
+def _is_open_ended_mounting_options_query(query: str) -> bool:
+    query_text = _normalize(query)
+    return (
+        _has_series_or_category_context(query)
+        and not _mentions_specific_mounting_type(query)
+        and _intent_contains(query_text, MOUNTING_QUERY_CUES)
+        and _intent_contains(query_text, MOUNTING_OPTIONS_QUERY_CUES)
+    )
 
 
 def _is_mountings_family_query(query: str) -> bool:
-    return _intent_contains(_normalize(query), MOUNTING_QUERY_CUES) or _mentions_specific_mounting_type(query)
+    return _is_mounting_compatibility_query(query) or _is_open_ended_mounting_options_query(query)
+
+
+def _is_exact_lamp_model_query(query: str) -> bool:
+    return bool(EXACT_LAMP_MODEL_RE.search(_normalize(query)))
+
+
+def _has_application_domain_context(query: str) -> bool:
+    query_text = _normalize(query)
+    return any(
+        cue in query_text
+        for cue in APPLICATION_RECOMMENDATION_KEYWORDS
+        if cue not in GENERIC_RECOMMENDATION_CUES
+    )
+
+
+def _is_structured_lamp_filter_query(query: str) -> bool:
+    query_text = _normalize(query)
+    if (
+        not query_text
+        or _is_explicit_document_request(query)
+        or _is_codes_family_query(query)
+        or _is_exact_lamp_model_query(query)
+        or _has_application_domain_context(query)
+        or (
+            any(marker in query_text for marker in SERIES_COMPARISON_QUERY_CUES)
+            and _distinct_series_mentions(query) > 1
+        )
+    ):
+        return False
+    has_filter_value = bool(
+        STRUCTURED_FILTER_MEASUREMENT_RE.search(query_text)
+        or EXPLOSION_FILTER_RE.search(query_text)
+    )
+    has_selection_operation = _intent_contains(query_text, FILTER_SELECTION_QUERY_CUES)
+    has_named_mounting_constraint = _mentions_specific_mounting_type(query)
+    has_canonical_series_constraint = resolve_explicit_series_alias(query) is not None
+    return (
+        has_filter_value
+        or (has_selection_operation and has_named_mounting_constraint)
+        or (has_selection_operation and has_canonical_series_constraint)
+    )
 
 
 def _is_series_description_query(query: str) -> bool:
     query_text = _normalize(query)
-    if _is_explicit_document_request(query) or _is_mountings_family_query(query) or _is_codes_family_query(query):
+    if (
+        _is_explicit_document_request(query)
+        or _is_mountings_family_query(query)
+        or _is_codes_family_query(query)
+        or _is_exact_lamp_model_query(query)
+        or _is_structured_lamp_filter_query(query)
+    ):
         return False
     if _is_broad_series_query(query):
         return True
@@ -1900,7 +1994,7 @@ def _infer_intent_family(query: str, *, explicit_document_request: bool) -> str:
         return "catalog_lookup"
     if _intent_contains(query_text, PORTFOLIO_LOOKUP_KEYWORDS):
         return "portfolio_lookup"
-    if _is_mountings_family_query(query):
+    if _is_mountings_family_query(query) or _is_structured_lamp_filter_query(query) or _is_exact_lamp_model_query(query):
         return "catalog_lookup"
     if _intent_contains(query_text, APPLICATION_RECOMMENDATION_KEYWORDS) or _intent_contains(query_text, ORCHESTRATION_KEYWORDS):
         return "application_recommendation"
@@ -1977,6 +2071,8 @@ def _preferred_route_ids_for_intent(query: str, intent_family: str) -> list[str]
             return [DOCUMENT_SUBTYPE_ROUTE_IDS[document_type], "corp_db.documents_by_lamp_name"]
         return ["corp_db.documents_by_lamp_name"]
     if intent_family == "catalog_lookup":
+        if _is_exact_lamp_model_query(query):
+            return ["corp_db.catalog_lookup", "corp_db.sku_lookup", "corp_db.lamp_filters"]
         if _is_series_description_query(query):
             return ["corp_kb.series_description", "corp_kb.company_common"]
         if _is_reverse_code_lookup_query(query):
@@ -1989,12 +2085,12 @@ def _preferred_route_ids_for_intent(query: str, intent_family: str) -> list[str]
             return ["corp_db.showcase_lamps_by_category", "corp_db.category_lamps", "corp_db.catalog_lookup"]
         if _is_sphere_category_query(query):
             return ["corp_db.sphere_curated_categories", "corp_db.category_lamps", "corp_db.catalog_lookup", "corp_db.category_mountings"]
+        if _is_structured_lamp_filter_query(query):
+            return ["corp_db.lamp_filters", "corp_db.catalog_lookup", "corp_db.category_lamps", "corp_db.category_mountings"]
         if _is_mounting_compatibility_query(query):
-            return ["corp_db.lamp_mounting_compatibility", "corp_db.category_mountings", "corp_db.catalog_lookup", "corp_db.category_lamps"]
-        if _is_mountings_family_query(query):
-            return ["corp_db.category_mountings", "corp_db.lamp_mounting_compatibility", "corp_db.catalog_lookup", "corp_db.category_lamps"]
-        if _is_series_or_category_mounting_query(query):
-            return ["corp_db.category_mountings", "corp_db.lamp_mounting_compatibility", "corp_db.catalog_lookup", "corp_db.category_lamps"]
+            return ["corp_db.lamp_mounting_compatibility", "corp_db.category_mountings", "corp_db.lamp_filters", "corp_db.catalog_lookup"]
+        if _is_open_ended_mounting_options_query(query):
+            return ["corp_db.category_mountings", "corp_db.lamp_mounting_compatibility", "corp_db.lamp_filters", "corp_db.catalog_lookup"]
         return ["corp_db.catalog_lookup", "corp_db.sku_lookup", "corp_db.category_lamps", "corp_db.sphere_curated_categories"]
     if intent_family == "company_fact":
         if _intent_contains(query_text, ("luxnet", "люкснет")):
@@ -2193,6 +2289,15 @@ def _compact_selector_route_card(route: dict[str, Any], *, sphere_context: dict[
                 "oracl",
                 "category",
                 "series",
+                "ip",
+                "beam_pattern",
+                "climate_execution",
+                "electrical_protection_class",
+                "explosion_protection_marking",
+                "supply_voltage_raw",
+                "dimensions_raw",
+                "power_factor_operator",
+                "voltage_kind",
                 "explosion_protected",
                 "sphere",
                 "mounting_type",
@@ -2207,6 +2312,8 @@ def _compact_selector_route_card(route: dict[str, Any], *, sphere_context: dict[
             or key.endswith("_max")
         },
     }
+    if isinstance(schema.get("anyOf"), list):
+        compact_schema["anyOf"] = list(schema["anyOf"])
     fallback_policy = route_payload.get("fallback_policy") if isinstance(route_payload.get("fallback_policy"), dict) else {}
     return {
         "route_id": str(route.get("route_id") or ""),

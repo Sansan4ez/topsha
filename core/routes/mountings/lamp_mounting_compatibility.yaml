@@ -4,7 +4,11 @@ route_kind: corp_table
 authority: primary
 title: Lamp and mounting compatibility
 summary: Structured route for validating a named mounting type against a lamp, series, or category.
-when_to_use: Select only when the user names a specific mounting type and asks whether it is compatible with a lamp, series, or category. Do not use for open-ended requests asking which mounting types are available.
+when_to_use: >-
+  Select only when the user names a specific mounting type and asks whether it is compatible with a named
+  series or category. The arguments must include mounting_type plus category or series. Do not use for
+  open-ended requests asking which mounting types are available or for lamp selection by mounting and other
+  structured catalog constraints.
 schema_ref: lamp_mounting_compatibility.schema.json
 topics:
 - catalog

@@ -405,6 +405,45 @@ class RouteSelectorFakeTests(unittest.TestCase):
                 self.assertEqual(route_hint["tool_args"], expected_execution_args)
                 self.assertEqual(route_selection["selector"]["argument_builder_status"], "valid")
 
+    def test_structured_series_and_mounting_queries_execute_through_lamp_filters(self):
+        cases = (
+            (
+                "Какие серии с рассеивателем имеют IP66 и мощность 35 Вт?",
+                {"ip": "66", "power_w_min": 35, "power_w_max": 35},
+            ),
+            (
+                "Подбери светильники 35 Вт, IP66, накладной корпус",
+                {
+                    "ip": "66",
+                    "power_w_min": 35,
+                    "power_w_max": 35,
+                    "mounting_type": "накладной корпус",
+                },
+            ),
+        )
+        for query, expected_args in cases:
+            with self.subTest(query=query):
+                fake = ScriptedRouteSelectorLLM(
+                    [
+                        _choice("corp_db.lamp_filters"),
+                        _arguments(expected_args),
+                    ]
+                )
+
+                route_selection, route_hint, _secondary = self._run(query, fake)
+
+                self.assertEqual(route_hint["route_id"], "corp_db.lamp_filters")
+                self.assertEqual(
+                    route_hint["tool_args"],
+                    {**expected_args, "kind": "lamp_filters", "fuzzy": True},
+                )
+                self.assertEqual(route_selection["selector"]["argument_builder_status"], "valid")
+                selector_text = "\n".join(
+                    str(message.get("content") or "")
+                    for message in fake.calls[0][0]
+                )
+                self.assertIn("corp_db.lamp_filters", selector_text)
+
     def test_lamp_filter_explicit_alias_conflict_repairs_locally(self):
         fake = ScriptedRouteSelectorLLM(
             [

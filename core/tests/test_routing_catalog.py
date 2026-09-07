@@ -879,6 +879,44 @@ class RoutingCatalogTests(unittest.TestCase):
                         self.assertNotIn("corp_db.catalog_lookup", payload["candidate_route_ids"])
                         self.assertNotIn("corp_db.lamp_filters", payload["candidate_route_ids"])
 
+    def test_structured_filter_intent_survives_series_and_mounting_heuristics(self):
+        cases = (
+            (
+                "Какие серии с рассеивателем имеют IP66 и мощность 35 Вт?",
+                {"ip", "power_w_min", "power_w_max"},
+            ),
+            (
+                "Подбери светильники 35 Вт, IP66, накладной корпус",
+                {"ip", "power_w_min", "power_w_max", "mounting_type"},
+            ),
+        )
+        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as docs_tmp:
+            with patch.dict(
+                os.environ,
+                {"DOC_REPO_ROOT": repo_tmp, "CORP_DOCS_ROOT": docs_tmp},
+                clear=False,
+            ):
+                for query, expected_properties in cases:
+                    with self.subTest(query=query):
+                        selection = select_route(query)
+                        full_payload = build_route_selector_payload(query)
+                        limited_payload = build_route_selector_payload(query, limit=5)
+
+                        self.assertEqual(selection["intent_family"], "catalog_lookup")
+                        self.assertEqual(selection["selected"]["route_id"], "corp_db.lamp_filters")
+                        for payload in (full_payload, limited_payload):
+                            self.assertEqual(payload["candidate_route_ids"][0], "corp_db.lamp_filters")
+                            self.assertIn("corp_db.lamp_filters", payload["candidate_route_ids"])
+                            routes = {
+                                route["route_id"]: route
+                                for route in selector_payload_leaf_routes(payload)
+                            }
+                            self.assertTrue(
+                                expected_properties.issubset(
+                                    routes["corp_db.lamp_filters"]["argument_schema"]["properties"]
+                                )
+                            )
+
     def test_select_route_prefers_curated_sphere_categories_for_broad_category_questions(self):
         with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as docs_tmp:
             with patch.dict(
@@ -910,17 +948,26 @@ class RoutingCatalogTests(unittest.TestCase):
                 {"DOC_REPO_ROOT": repo_tmp, "CORP_DOCS_ROOT": docs_tmp},
                 clear=False,
             ):
-                available_query = "Какое крепление подходит для светильников серии NL Nova?"
-                available_selection = select_route(available_query)
-                available_payload = build_route_selector_payload(available_query, limit=5)
+                available_queries = (
+                    "Какие крепления доступны у серии NL Nova?",
+                    "Какое крепление подходит для светильников серии NL Nova?",
+                )
+                available_results = [
+                    (
+                        select_route(query),
+                        build_route_selector_payload(query, limit=5),
+                    )
+                    for query in available_queries
+                ]
 
                 compatibility_query = "Совместима ли серия NL Nova с креплением «накладной корпус»?"
                 compatibility_selection = select_route(compatibility_query)
                 compatibility_payload = build_route_selector_payload(compatibility_query, limit=5)
 
-        self.assertEqual(available_selection["intent_family"], "catalog_lookup")
-        self.assertEqual(available_selection["selected"]["route_id"], "corp_db.category_mountings")
-        self.assertEqual(available_payload["candidate_route_ids"][0], "corp_db.category_mountings")
+        for available_selection, available_payload in available_results:
+            self.assertEqual(available_selection["intent_family"], "catalog_lookup")
+            self.assertEqual(available_selection["selected"]["route_id"], "corp_db.category_mountings")
+            self.assertEqual(available_payload["candidate_route_ids"][0], "corp_db.category_mountings")
         self.assertEqual(compatibility_selection["intent_family"], "catalog_lookup")
         self.assertEqual(
             compatibility_selection["selected"]["route_id"],
@@ -930,6 +977,41 @@ class RoutingCatalogTests(unittest.TestCase):
             compatibility_payload["candidate_route_ids"][0],
             "corp_db.lamp_mounting_compatibility",
         )
+        compatibility_route = next(
+            route
+            for route in selector_payload_leaf_routes(compatibility_payload)
+            if route["route_id"] == "corp_db.lamp_mounting_compatibility"
+        )
+        self.assertEqual(compatibility_route["argument_schema"]["required"], ["mounting_type"])
+        self.assertEqual(
+            compatibility_route["argument_schema"]["anyOf"],
+            [{"required": ["category"]}, {"required": ["series"]}],
+        )
+
+    def test_routing_boundary_matrix_keeps_specialized_routes_distinct(self):
+        cases = (
+            ("На каких сериях устанавливают закаленное стекло?", "corp_kb.series_description"),
+            ("Коротко: чем отличается серия LAD LED R500 от LAD LED R700?", "corp_kb.series_description"),
+            ("LAD LED R320-2-10G-230AC-50K Ex", "corp_db.catalog_lookup"),
+            ("2ex световой поток не менее 11540 Лм", "corp_db.lamp_filters"),
+            ("Нужен светильник Ex", "corp_db.lamp_filters"),
+            ("Подбери освещение для склада с накладным корпусом", "corp_db.application_recommendation"),
+            ("Покажи паспорт на NL Nova IP66", "corp_db.passport_by_lamp_name"),
+            ("Какой ETM-код у NL Nova 35 Вт?", "corp_db.sku_codes_lookup"),
+        )
+        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as docs_tmp:
+            with patch.dict(
+                os.environ,
+                {"DOC_REPO_ROOT": repo_tmp, "CORP_DOCS_ROOT": docs_tmp},
+                clear=False,
+            ):
+                for query, expected_route_id in cases:
+                    with self.subTest(query=query):
+                        selection = select_route(query)
+                        limited_payload = build_route_selector_payload(query, limit=5)
+
+                        self.assertEqual(selection["selected"]["route_id"], expected_route_id)
+                        self.assertEqual(limited_payload["candidate_route_ids"][0], expected_route_id)
 
     def test_select_route_prefers_documents_by_lamp_for_lamp_document_list_queries(self):
         with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as docs_tmp:
