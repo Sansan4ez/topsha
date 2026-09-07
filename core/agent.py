@@ -754,6 +754,82 @@ def _portfolio_lookup_fallback_call(message: str) -> tuple[str, dict[str, Any], 
     return "corp_db_search", args, route_hint
 
 
+def _certificate_coverage_summary(
+    tool_args: dict[str, Any],
+    tool_result: ToolResult,
+    route_hint: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Summarize per-name outcomes without pretending to recover the natural-language request.
+
+    ``tool_args.names`` is the only request set the executor actually received.  Comparing it
+    with the executor's echoed filter catches an inconsistent batch, while the explicit caveat
+    keeps the finalizer from treating that set as a semantic extraction of the user's message.
+    """
+    if str(tool_args.get("kind") or "") != "lamp_documents_index" or str(tool_args.get("document_type") or "") != "certificate":
+        return None
+    names = tool_args.get("names")
+    if not isinstance(names, list):
+        name = str(tool_args.get("name") or "").strip()
+        names = [name] if name else []
+        if not names:
+            return None
+    requested = [str(name).strip() for name in names if str(name).strip()]
+    declared_args = (route_hint or {}).get("selector_declared_tool_args")
+    declared_names = declared_args.get("names") if isinstance(declared_args, dict) else None
+    if isinstance(declared_names, list):
+        declared_names = [str(name).strip() for name in declared_names if str(name).strip()]
+        if declared_names:
+            requested = declared_names
+
+    payload = _parse_json_object(tool_result.output or "")
+    filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
+    echoed_names = filters.get("names")
+    normalized_requested = [_normalize_document_series_name(name) for name in requested]
+    duplicate_request = len(set(normalized_requested)) != len(normalized_requested)
+    normalized_echoed = (
+        [_normalize_document_series_name(name) for name in echoed_names if str(name).strip()]
+        if isinstance(echoed_names, list)
+        else []
+    )
+    coverage_status = "unknown"
+    if normalized_echoed != normalized_requested:
+        coverage_status = "unknown_request_batch"
+    elif duplicate_request:
+        coverage_status = "duplicate_request_batch"
+    elif payload.get("status") == "empty":
+        coverage_status = "empty"
+    elif payload.get("status") == "success" and isinstance(payload.get("results"), list):
+        coverage_status = "complete" if payload.get("results") else "empty"
+
+    raw_rows = payload.get("results")
+    rows = [row for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
+    found: list[str] = []
+    missing: list[str] = []
+    for requested_name in requested:
+        normalized_name = _normalize_document_series_name(requested_name)
+        matching_rows = [
+            row for row in rows
+            if _normalize_document_series_name(row.get("name")) == normalized_name
+            or _normalize_document_series_name(row.get("name")).startswith(f"{normalized_name}-")
+            or _normalize_document_series_name(row.get("name")).startswith(f"{normalized_name} ")
+        ]
+        if matching_rows:
+            found.extend(str(row.get("name") or requested_name).strip() for row in matching_rows)
+        else:
+            missing.append(requested_name)
+    if coverage_status == "complete" and missing:
+        coverage_status = "partial"
+
+    return {
+        "requested_names": requested,
+        "found_names": list(dict.fromkeys(name for name in found if name)),
+        "missing_names": list(dict.fromkeys(missing)),
+        "coverage_status": coverage_status,
+        "scope": "selector_contract_and_executor_args",
+        "limitation": "Контракт ограничен именами, переданными selector/argument builder; не является семантическим извлечением сущностей из исходного сообщения.",
+    }
+
+
 async def _finalize_with_scoped_evidence(
     *,
     base_messages: list[dict[str, Any]],
@@ -769,6 +845,9 @@ async def _finalize_with_scoped_evidence(
         "tool_args": tool_args,
         "tool_output": str(tool_result.output or "")[:_finalizer_evidence_max_chars()],
     }
+    certificate_coverage = _certificate_coverage_summary(tool_args, tool_result, route_hint)
+    if certificate_coverage is not None:
+        evidence_payload["certificate_coverage"] = certificate_coverage
     finalizer_messages = list(base_messages)
     finalizer_messages.append(
         {
@@ -917,19 +996,45 @@ def _certificate_direct_link_response(
         return ""
     names = tool_args.get("names")
     if not isinstance(names, list):
-        names = (payload.get("filters") or {}).get("names")
-    requested_names = [str(name).strip() for name in names or [] if str(name).strip()]
-    if not requested_names:
+        return ""
+    requested_names = [str(name).strip() for name in names if str(name).strip()]
+    if not requested_names or len({_normalize_document_series_name(name) for name in requested_names}) != len(requested_names):
+        return ""
+    declared_args = (route_hint or {}).get("selector_declared_tool_args")
+    declared_names = declared_args.get("names") if isinstance(declared_args, dict) else None
+    if not isinstance(declared_names, list):
+        return ""
+    declared_names = [str(name).strip() for name in declared_names if str(name).strip()]
+    if (
+        not declared_names
+        or len({name.casefold() for name in declared_names}) != len(declared_names)
+        or [_normalize_document_series_name(name) for name in declared_names]
+        != [_normalize_document_series_name(name) for name in requested_names]
+    ):
+        return ""
+
+    # The executor echoes the bounded batch it actually received.  If that contract is absent
+    # or differs from the validated tool args, coverage is unknown and the normal finalizer must
+    # explain requested/found/missing instead of silently rendering a subset.
+    filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
+    echoed_names = filters.get("names")
+    if not isinstance(echoed_names, list):
+        return ""
+    if [
+        _normalize_document_series_name(name) for name in echoed_names if str(name).strip()
+    ] != [_normalize_document_series_name(name) for name in requested_names]:
         return ""
 
     rows = [row for row in payload["results"] if isinstance(row, dict)]
     direct_links: list[tuple[str, str, str, str, str, str]] = []
     for requested_name in requested_names:
         normalized_name = _normalize_document_series_name(requested_name)
-        matched: tuple[str, str, str, str, str] | None = None
+        exact_matches: list[tuple[str, str, str, str, str]] = []
         for row in rows:
             row_name = _normalize_document_series_name(row.get("name"))
-            if not (row_name == normalized_name or row_name.startswith(f"{normalized_name}-") or row_name.startswith(f"{normalized_name} ")):
+            # Prefix matches resolve a series to one SKU but do not prove that the document
+            # applies to the whole series.  They therefore stay in the scoped finalizer.
+            if row_name != normalized_name:
                 continue
             primary = row.get("primary_document") if isinstance(row.get("primary_document"), dict) else {}
             if str(primary.get("document_type") or "") != "certificate":
@@ -938,13 +1043,12 @@ def _certificate_direct_link_response(
             if url:
                 title = str(primary.get("title") or "Сертификат").strip() or "Сертификат"
                 subtype, scope = _certificate_evidence_details(primary)
-                matched = (str(row.get("name") or requested_name).strip(), title, url, subtype, scope)
-                break
-        # A partial response must retain normal evidence finalization, which can explain what
-        # was and was not found.  Deterministic rendering is reserved for complete requests.
-        if matched is None:
+                exact_matches.append((str(row.get("name") or requested_name).strip(), title, url, subtype, scope))
+        # Zero rows means missing; multiple rows mean ambiguous identity. Both cases need the
+        # scoped finalizer, which can state the limitation without claiming a deterministic link.
+        if len(exact_matches) != 1:
             return ""
-        direct_links.append((requested_name, *matched))
+        direct_links.append((requested_name, *exact_matches[0]))
 
     requested_subtypes: list[str] = []
     if "ce" in message_text:
@@ -3613,6 +3717,7 @@ async def _select_route_with_llm(
         raise RuntimeError("route selector returned no choices")
     message = choices[0].get("message") or {}
     content = str(message.get("content") or "").strip()
+    selector_content = content
     validation = validate_route_choice_output(content, candidate_routes)
     first_validation_error_code = ""
     first_validation_error = ""
@@ -3635,12 +3740,25 @@ async def _select_route_with_llm(
         if repair_choices:
             repair_content = str((repair_choices[0].get("message") or {}).get("content") or "").strip()
         validation = validate_route_choice_output(repair_content, candidate_routes, repair_attempted=True)
+        selector_content = repair_content
         repair_status = "succeeded" if validation.valid else "failed"
     if not validation.valid:
         raise RuntimeError(f"route selector output rejected: {validation.error_code}: {validation.error}")
     selector_a_latency_ms = (perf_counter() - call_a_started) * 1000
 
     choice_route = dict(validation.route or {})
+    # Preserve the selector's own name set as a coverage contract.  The argument builder may
+    # normalize or accidentally drop names; comparing its result with this independent stage-A
+    # payload lets the certificate fast path fail closed without parsing the user's prose.
+    try:
+        selector_payload = json.loads(selector_content)
+    except (TypeError, json.JSONDecodeError):
+        selector_payload = {}
+    selector_declared_tool_args = (
+        dict(selector_payload.get("tool_args") or {})
+        if isinstance(selector_payload, dict) and isinstance(selector_payload.get("tool_args"), dict)
+        else {}
+    )
 
     # RFC-029 workstream 2, Call B: argument construction against only the selected route's
     # own JSON Schema. Skipped entirely for fully locked/templated routes. A schema violation
@@ -3725,6 +3843,7 @@ async def _select_route_with_llm(
 
     selected_route = dict(choice_route)
     selected_route["tool_args"] = dict(final_tool_args)
+    selected_route["selector_declared_tool_args"] = selector_declared_tool_args
     selected_route["selected_family_id"] = str(validation.selected_family_id or selected_route.get("family_id") or "")
     selected_route["selection_reason"] = str((validation.route or {}).get("selection_reason") or "") or "llm_selector"
     selected_route["selector_confidence"] = validation.confidence
