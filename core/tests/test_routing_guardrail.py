@@ -2581,6 +2581,121 @@ class RoutingGuardrailTests(unittest.TestCase):
         self.assertEqual(meta["retrieval_selected_source"], "corp_db")
         self.assertEqual(meta["application_recovery_outcome"], "")
 
+    def test_application_portfolio_rows_are_bounded_and_preserve_source_order(self):
+        payload = {
+            "status": "success",
+            "filters": {"limit_portfolio": 3},
+            "portfolio_examples": [
+                {"name": "Без ссылки"},
+                {"name": "Второй", "url": "https://example.org/second"},
+                {"name": "Третий", "url": "https://example.org/third"},
+                {"name": "За пределами лимита", "url": "https://example.org/fourth"},
+            ],
+        }
+
+        rows = _MODULE._bounded_application_portfolio_rows(payload)
+
+        self.assertEqual([row["name"] for row in rows or []], ["Без ссылки", "Второй", "Третий"])
+        self.assertIsNone(
+            _MODULE._bounded_application_portfolio_rows(
+                {"portfolio_examples": [{"name": "broken", "url": "not-a-url"}]}
+            )
+        )
+        self.assertEqual(
+            _MODULE._bounded_application_portfolio_rows(
+                {"portfolio_examples": [{"name": "ignored"}]}, limit_portfolio=0
+            ),
+            [],
+        )
+
+    def test_application_portfolio_guard_and_renderer_share_bounded_rows(self):
+        payload = {
+            "status": "success",
+            "resolved_application": {"sphere_name": "Тестовая сфера"},
+            "recommended_lamps": [{"name": "Лампа", "url": "https://example.org/lamp"}],
+            "portfolio_examples": [
+                {"name": "Без ссылки"},
+                {"name": "Со ссылкой", "url": "https://example.org/project"},
+                {"name": "Третий", "url": "https://example.org/third"},
+            ],
+            "filters": {"limit_portfolio": 2},
+            "follow_up_question": "Уточните высоту установки.",
+        }
+        routing_state = {"user_message": "Покажи примеры портфолио"}
+        finalizer = AsyncMock(side_effect=AssertionError("deterministic portfolio response expected"))
+        with patch.object(_MODULE, "call_llm", finalizer):
+            response = asyncio.run(_MODULE._finalize_or_fail_closed(
+                base_messages=[],
+                tool_name="corp_db_search",
+                tool_args={"kind": "application_recommendation", "limit_portfolio": 2},
+                tool_result=_ToolResult(True, output=json.dumps(payload, ensure_ascii=False)),
+                route_hint={"route_id": "corp_db.application_recommendation"},
+                routing_state=routing_state,
+            ))
+
+        self.assertIn("Со ссылкой — https://example.org/project", response)
+        self.assertNotIn("https://example.org/third", response)
+        self.assertEqual(routing_state["finalizer_mode"], "deterministic_application_portfolio")
+        self.assertEqual(finalizer.await_count, 0)
+
+    def test_application_portfolio_renderer_keeps_multiple_rows_and_lamp_evidence(self):
+        payload = {
+            "status": "success",
+            "resolved_application": {"sphere_name": "Тестовая сфера"},
+            "recommended_lamps": [
+                {"name": "Лампа 1", "url": "https://example.org/lamp-1"},
+                {"name": "Лампа 2", "url": "https://example.org/lamp-2"},
+            ],
+            "portfolio_examples": [
+                {"name": "Без ссылки"},
+                {"name": "Со ссылкой", "url": "https://example.org/project"},
+                {"name": "Ещё проект", "url": "https://example.org/project-2"},
+            ],
+            "filters": {"limit_portfolio": 3},
+            "follow_up_question": "Уточните высоту установки.",
+        }
+
+        response = _MODULE._application_portfolio_response(
+            message="Покажи примеры портфолио",
+            tool_name="corp_db_search",
+            tool_args={"kind": "application_recommendation", "limit_portfolio": 3},
+            tool_result=_ToolResult(True, output=json.dumps(payload, ensure_ascii=False)),
+            route_hint={"route_id": "corp_db.application_recommendation"},
+        )
+
+        self.assertIn("Без ссылки", response)
+        self.assertIn("Со ссылкой — https://example.org/project", response)
+        self.assertIn("Ещё проект — https://example.org/project-2", response)
+        self.assertIn("https://example.org/lamp-1", response)
+        self.assertIn("Уточните высоту установки", response)
+
+    def test_application_portfolio_malformed_partial_evidence_uses_scoped_finalizer(self):
+        payload = {
+            "status": "success",
+            "resolved_application": {"sphere_name": "Тестовая сфера"},
+            "recommended_lamps": [{"name": "Лампа", "url": "https://example.org/lamp"}],
+            "portfolio_examples": [
+                {"name": "Проект", "url": "https://example.org/project"},
+                {"name": "Поврежденная строка", "url": "not-a-url"},
+            ],
+            "filters": {"limit_portfolio": 2},
+        }
+        routing_state = {"user_message": "Покажи 3 примера портфолио", "finalizer_mode": "llm"}
+        finalizer = AsyncMock(return_value={"choices": [{"message": {"content": "partial"}}]})
+        with patch.object(_MODULE, "call_llm", finalizer):
+            response = asyncio.run(_MODULE._finalize_or_fail_closed(
+                base_messages=[],
+                tool_name="corp_db_search",
+                tool_args={"kind": "application_recommendation", "limit_portfolio": 2},
+                tool_result=_ToolResult(True, output=json.dumps(payload, ensure_ascii=False)),
+                route_hint={"route_id": "corp_db.application_recommendation"},
+                routing_state=routing_state,
+            ))
+
+        self.assertEqual(response, "partial")
+        self.assertEqual(routing_state["finalizer_mode"], "llm")
+        self.assertEqual(finalizer.await_count, 1)
+
     def test_application_recommendation_preserves_requested_portfolio_evidence(self):
         portfolio_url = "https://ladzavod.ru/portfolio/sports/stadium"
         response, exec_mock, meta = self._run_flow(

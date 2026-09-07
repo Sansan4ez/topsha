@@ -891,6 +891,50 @@ def _normalize_document_series_name(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+APPLICATION_PORTFOLIO_RENDER_LIMIT = 10
+
+
+def _bounded_application_portfolio_rows(
+    payload: dict[str, Any],
+    *,
+    limit_portfolio: Any = None,
+) -> list[dict[str, Any]] | None:
+    """Return the portfolio rows the deterministic application renderer can preserve.
+
+    The executor already bounds this list.  Keep that validated bound here as well so the
+    fast-path guard and renderer inspect exactly the same evidence, in source order.  A row
+    without a URL is still renderable (its missing link is visible), while malformed rows are
+    left to the scoped finalizer rather than being silently dropped.
+    """
+    portfolio = payload.get("portfolio_examples")
+    if not isinstance(portfolio, list):
+        return None
+
+    if limit_portfolio is None:
+        filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
+        limit_portfolio = filters.get("limit_portfolio")
+    if type(limit_portfolio) is not int:
+        # application_recommendation defaults to two portfolio rows in the executor.
+        limit_portfolio = 2
+    limit = max(0, min(limit_portfolio, APPLICATION_PORTFOLIO_RENDER_LIMIT))
+    bounded_rows = portfolio[:limit]
+    if not bounded_rows:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for row in bounded_rows:
+        if not isinstance(row, dict):
+            return None
+        name = str(row.get("name") or "").strip()
+        if not name:
+            return None
+        url = str(row.get("url") or "").strip()
+        if url and not URL_RE.match(url):
+            return None
+        rows.append(row)
+    return rows
+
+
 def _application_portfolio_response(
     *,
     message: str,
@@ -926,12 +970,18 @@ def _application_portfolio_response(
     if payload.get("status") != "success":
         return ""
     lamps = payload.get("recommended_lamps")
-    portfolio = payload.get("portfolio_examples")
-    if not isinstance(lamps, list) or not lamps or not isinstance(portfolio, list):
+    if not isinstance(lamps, list) or not lamps or any(
+        not isinstance(row, dict) or not str(row.get("name") or "").strip()
+        for row in lamps
+    ):
         return ""
-    if not any(isinstance(row, dict) and str(row.get("url") or "").strip() for row in portfolio):
+    portfolio_rows = _bounded_application_portfolio_rows(
+        payload,
+        limit_portfolio=tool_args.get("limit_portfolio"),
+    )
+    if not portfolio_rows or not any(str(row.get("url") or "").strip() for row in portfolio_rows):
         return ""
-    return _render_application_payload(payload)
+    return _render_application_payload(payload, portfolio_rows=portfolio_rows)
 
 
 def _certificate_evidence_details(document: dict[str, Any]) -> tuple[str, str]:
@@ -2040,14 +2090,19 @@ def _render_portfolio_entity_payload(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _render_application_payload(payload: dict[str, Any]) -> str:
+def _render_application_payload(
+    payload: dict[str, Any],
+    *,
+    portfolio_rows: list[dict[str, Any]] | None = None,
+) -> str:
     status = str(payload.get("status") or "")
     if status == "needs_clarification":
         return str(payload.get("follow_up_question") or "").strip()
     resolved = payload.get("resolved_application") if isinstance(payload.get("resolved_application"), dict) else {}
     sphere_name = str(resolved.get("sphere_name") or "подходящей сферы").strip()
     lamps = payload.get("recommended_lamps") if isinstance(payload.get("recommended_lamps"), list) else []
-    portfolio = payload.get("portfolio_examples") if isinstance(payload.get("portfolio_examples"), list) else []
+    if portfolio_rows is None:
+        portfolio_rows = _bounded_application_portfolio_rows(payload) or []
     lines = [f"Подобрал вариант для сферы: {sphere_name}."]
     if lamps:
         lines.append("Подходящие светильники:")
@@ -2061,11 +2116,12 @@ def _render_application_payload(payload: dict[str, Any]) -> str:
             if url:
                 detail += f" ({url})"
             lines.append(f"- {detail}")
-    if portfolio:
-        row = portfolio[0] if isinstance(portfolio[0], dict) else {}
-        name = str(row.get("name") or "пример объекта").strip()
-        url = str(row.get("url") or "").strip()
-        lines.append(f"Пример объекта: {name}{f' — {url}' if url else ''}")
+    if portfolio_rows:
+        lines.append("Примеры объектов:")
+        for row in portfolio_rows:
+            name = str(row.get("name") or "пример объекта").strip()
+            url = str(row.get("url") or "").strip()
+            lines.append(f"- {name}{f' — {url}' if url else ''}")
     follow_up = str(payload.get("follow_up_question") or "").strip()
     if follow_up:
         lines.append(follow_up)
