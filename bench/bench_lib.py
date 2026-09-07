@@ -612,6 +612,77 @@ def check_number(answer: str, value: float, tolerance: float) -> tuple[bool, str
     return False, f"expected={value}±{tolerance} got={nums[:10]}"
 
 
+def check_entity_url_pairs(answer: str, expected: list[dict[str, Any]]) -> tuple[bool, str]:
+    """Require each requested entity to be paired with its evidence URL.
+
+    A global ``contains_all`` check can pass when entities and links are present but
+    shuffled, or when one entity is omitted. Keeping this check line-local (or on the
+    immediately following Markdown-link line) makes it a small, deterministic answer
+    contract without attempting to judge prose.
+    """
+    lines = [norm_text(line) for line in (answer or "").splitlines() if norm_text(line)]
+    expected_entities = [
+        norm_text(str(pair.get("entity") or ""))
+        for pair in expected
+        if isinstance(pair, dict)
+    ]
+    if len(set(expected_entities)) != len(expected_entities):
+        return False, "duplicate_entity"
+    missing: list[str] = []
+    for pair in expected:
+        if not isinstance(pair, dict):
+            return False, "bad_pair_format"
+        entity = norm_text(str(pair.get("entity") or ""))
+        url = norm_text(str(pair.get("url") or ""))
+        if not entity or not url:
+            return False, "bad_pair_value"
+        forbidden = pair.get("forbidden")
+        if forbidden is not None and (
+            not isinstance(forbidden, list) or not all(isinstance(item, str) for item in forbidden)
+        ):
+            return False, "bad_forbidden_value"
+        associated: list[tuple[int, str]] = []
+        for index, line in enumerate(lines):
+            if entity in line and url in line:
+                associated.append((index, line))
+            elif index > 0 and entity in lines[index - 1] and url in line:
+                associated.append((index, line))
+        if any(
+            other != entity and other in line
+            for _index, line in associated
+            for other in expected_entities
+        ):
+            associated = [
+                item for item in associated
+                if not any(other != entity and other in item[1] for other in expected_entities)
+            ]
+        if not associated:
+            missing.append(f"{pair.get('entity')} -> {pair.get('url')}")
+            continue
+        if isinstance(forbidden, list):
+            forbidden_norm = [norm_text(item) for item in forbidden]
+            for index, line in associated:
+                if not any(token in line for token in forbidden_norm):
+                    continue
+                next_entity_index = next(
+                    (
+                        next_index
+                        for next_index, next_line in enumerate(lines[index + 1 :], index + 1)
+                        if any(other != entity and other in next_line for other in expected_entities)
+                    ),
+                    len(lines),
+                )
+                if not any(
+                    "не подтвержд" in context or "не указан" in context or "ограничение:" in context
+                    for context in lines[index:next_entity_index]
+                ):
+                    missing.append(f"forbidden_on_pair={pair.get('entity')}:{forbidden}")
+                    break
+    if missing:
+        return False, f"missing_pairs={missing}"
+    return True, ""
+
+
 def eval_checks(answer: str, checks: list[dict[str, Any]]) -> tuple[bool, list[str]]:
     errors: list[str] = []
     for check in checks:
@@ -619,6 +690,16 @@ def eval_checks(answer: str, checks: list[dict[str, Any]]) -> tuple[bool, list[s
             errors.append("bad_check_format")
             continue
         ctype = str(check.get("type") or "")
+        if ctype == "entity_url_pairs":
+            val = check.get("value")
+            if not isinstance(val, list) or not all(isinstance(item, dict) for item in val):
+                errors.append("entity_url_pairs:bad_value")
+                continue
+            ok, msg = check_entity_url_pairs(answer, val)
+            if not ok:
+                errors.append(f"entity_url_pairs:{msg}")
+            continue
+
         if ctype in ("contains_all", "contains_any", "not_contains_any"):
             val = check.get("value")
             if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
@@ -733,6 +814,38 @@ def routing_accuracy_summary(dataset: list[dict[str, Any]], by_case: dict[str, d
     }
 
 
+EFFECTIVE_ROUTING_ASSERTION_KEYS = {
+    "effective_route_id",
+    "effective_route_family",
+    "effective_leaf_route_id",
+    "effective_source",
+    "used_fallback_route_id",
+    "used_fallback_scope",
+    "evidence_status",
+}
+
+
+def _eval_effective_routing(meta: dict[str, Any], routing: dict[str, Any]) -> tuple[bool, list[str]]:
+    field_map = {
+        "effective_route_id": "retrieval_route_id",
+        "effective_route_family": "retrieval_route_family",
+        "effective_leaf_route_id": "retrieval_leaf_route_id",
+        "effective_source": "retrieval_route_source",
+        "used_fallback_route_id": "retrieval_used_fallback_route_id",
+        "used_fallback_scope": "retrieval_used_fallback_scope",
+        "evidence_status": "retrieval_evidence_status",
+    }
+    errors: list[str] = []
+    for expected_key, meta_key in field_map.items():
+        if expected_key not in routing:
+            continue
+        expected = routing.get(expected_key)
+        actual = meta.get(meta_key)
+        if actual != expected:
+            errors.append(f"routing:{expected_key} expected={expected!r} actual={actual!r}")
+    return (len(errors) == 0), errors
+
+
 def eval_routing(
     meta: Optional[dict[str, Any]],
     routing: Optional[dict[str, Any]],
@@ -745,6 +858,9 @@ def eval_routing(
     errors: list[str] = []
     if not isinstance(meta, dict):
         return False, ["routing:no_meta"]
+
+    _, effective_errors = _eval_effective_routing(meta, routing)
+    errors.extend(effective_errors)
 
     expected_source = routing.get("selected_source")
     if expected_source:
@@ -829,9 +945,13 @@ def evaluate_case_result(case: dict[str, Any], row: Optional[dict[str, Any]]) ->
             "answer_ok": False,
             "algorithmic_ok": False,
             "routing_ok": False,
+            "selection_ok": False,
+            "execution_ok": False,
+            "answer_correctness_ok": None,
             "errors": ["missing_result"],
             "artifact": None,
             "payload": None,
+            "effective_routing_assertions": False,
         }
 
     status = str(row.get("status") or "ok")
@@ -843,6 +963,15 @@ def evaluate_case_result(case: dict[str, Any], row: Optional[dict[str, Any]]) ->
         routing,
         enforce_route_id=execution_mode in {"agent_chat", "agent_chat_shadow"},
     )
+    selection_routing = {
+        key: value for key, value in routing.items() if key not in EFFECTIVE_ROUTING_ASSERTION_KEYS
+    }
+    selection_ok, selection_errors = eval_routing(
+        meta,
+        selection_routing,
+        enforce_route_id=execution_mode in {"agent_chat", "agent_chat_shadow"},
+    )
+    execution_ok, execution_errors = _eval_effective_routing(meta or {}, routing) if isinstance(meta, dict) else (False, ["routing:no_meta"])
 
     if status != "ok":
         return {
@@ -852,6 +981,10 @@ def evaluate_case_result(case: dict[str, Any], row: Optional[dict[str, Any]]) ->
             "answer_ok": False,
             "algorithmic_ok": False,
             "routing_ok": routing_ok,
+            "selection_ok": selection_ok,
+            "execution_ok": execution_ok,
+            "answer_correctness_ok": None,
+            "effective_routing_assertions": bool(set(routing) & EFFECTIVE_ROUTING_ASSERTION_KEYS),
             "errors": [f"status={status}"],
             "artifact": None,
             "payload": None,
@@ -893,4 +1026,10 @@ def evaluate_case_result(case: dict[str, Any], row: Optional[dict[str, Any]]) ->
         "errors": errors,
         "artifact": artifact,
         "payload": payload,
+        "selection_ok": bool(selection_ok),
+        "selection_errors": selection_errors,
+        "execution_ok": bool(execution_ok),
+        "execution_errors": execution_errors,
+        "answer_correctness_ok": bool(answer_ok) if text_checks else None,
+        "effective_routing_assertions": bool(set(routing) & EFFECTIVE_ROUTING_ASSERTION_KEYS),
     }

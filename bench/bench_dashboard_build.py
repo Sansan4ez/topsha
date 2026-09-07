@@ -124,6 +124,9 @@ def build_run_report(dataset: list[dict[str, Any]], dataset_path: Path, results_
     tag_pass: dict[str, int] = {}
     validation_mode_totals: dict[str, int] = {}
     validation_mode_pass: dict[str, int] = {}
+    selection_totals = {"pass": 0, "fail": 0}
+    execution_totals = {"asserted": 0, "pass": 0, "fail": 0}
+    answer_correctness_totals = {"asserted": 0, "pass": 0, "fail": 0}
 
     cases_out: list[dict[str, Any]] = []
 
@@ -194,6 +197,13 @@ def build_run_report(dataset: list[dict[str, Any]], dataset_path: Path, results_
             evaluation = evaluate_case_result(case, row)
             passed = bool(evaluation["passed"])
             errors = list(evaluation["errors"])
+            selection_totals["pass" if evaluation["selection_ok"] else "fail"] += 1
+            if evaluation["effective_routing_assertions"]:
+                execution_totals["asserted"] += 1
+                execution_totals["pass" if evaluation["execution_ok"] else "fail"] += 1
+            if evaluation["answer_correctness_ok"] is not None:
+                answer_correctness_totals["asserted"] += 1
+                answer_correctness_totals["pass" if evaluation["answer_correctness_ok"] else "fail"] += 1
             if passed:
                 pass_count += 1
                 validation_mode_pass[validation_mode] = validation_mode_pass.get(validation_mode, 0) + 1
@@ -259,6 +269,9 @@ def build_run_report(dataset: list[dict[str, Any]], dataset_path: Path, results_
             }
             for t in sorted(tag_totals.keys())
         },
+        "routing_selection": selection_totals,
+        "effective_execution": execution_totals,
+        "answer_correctness": answer_correctness_totals,
         "validation_modes": {
             mode: {
                 "pass": validation_mode_pass.get(mode, 0),

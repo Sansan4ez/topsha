@@ -3,6 +3,7 @@ import unittest
 from bench.bench_lib import (
     eval_algorithmic_payload,
     eval_checks,
+    check_entity_url_pairs,
     evaluate_case_result,
     get_execution,
     get_validation,
@@ -116,6 +117,39 @@ class BenchAlgorithmicEvalTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertTrue(any(error.startswith("all_contains:") for error in errors))
 
+    def test_entity_url_pairs_require_per_entity_association(self):
+        expected = [
+            {"entity": "LAD LED R500", "url": "https://example/r500.pdf"},
+            {"entity": "LAD LED LINE", "url": "https://example/line.pdf"},
+        ]
+        answer = "- LAD LED R500: https://example/r500.pdf\n- LAD LED LINE: https://example/line.pdf"
+        passed, error = check_entity_url_pairs(answer, expected)
+        self.assertTrue(passed, error)
+
+        swapped = "- LAD LED R500: https://example/line.pdf\n- LAD LED LINE: https://example/r500.pdf"
+        passed, error = check_entity_url_pairs(swapped, expected)
+        self.assertFalse(passed)
+        self.assertIn("missing_pairs", error)
+
+        missing = "- LAD LED R500: https://example/r500.pdf"
+        passed, error = check_entity_url_pairs(missing, expected)
+        self.assertFalse(passed)
+
+        generic = "- CE-сертификат для LAD LED R500: https://example/r500.pdf"
+        passed, error = check_entity_url_pairs(
+            generic,
+            [{"entity": "LAD LED R500", "url": "https://example/r500.pdf", "forbidden": ["CE-сертификат"]}],
+        )
+        self.assertFalse(passed)
+        self.assertIn("forbidden_on_pair", error)
+
+        limited = "- Сертификат для LAD LED R500: https://example/r500.pdf\n  Ограничение: подтип CE не подтвержден."
+        passed, error = check_entity_url_pairs(
+            limited,
+            [{"entity": "LAD LED R500", "url": "https://example/r500.pdf", "forbidden": ["CE-сертификат"]}],
+        )
+        self.assertTrue(passed, error)
+
     def test_text_checks_support_forbidden_tokens(self):
         passed, errors = eval_checks(
             "Подходит LAD LED R320 Ex",
@@ -167,6 +201,47 @@ class BenchAlgorithmicEvalTests(unittest.TestCase):
         evaluation = evaluate_case_result(case, row)
         self.assertTrue(evaluation["passed"])
         self.assertEqual(evaluation["errors"], [])
+        self.assertTrue(evaluation["selection_ok"])
+        self.assertTrue(evaluation["execution_ok"])
+        self.assertIsNone(evaluation["answer_correctness_ok"])
+
+    def test_effective_route_assertions_are_separate_from_selection(self):
+        case = {
+            "id": "document-fallback",
+            "validation": {"mode": "legacy_text", "text_checks": [{"type": "contains_any", "value": ["паспорт"]}]},
+            "routing": {
+                "route_id": "passport_by_lamp_name",
+                "selected_source": "corp_db",
+                "effective_route_id": "corp_kb.company_common",
+                "used_fallback_route_id": "corp_kb.company_common",
+                "used_fallback_scope": "cross_family",
+                "evidence_status": "sufficient",
+            },
+        }
+        row = {
+            "status": "ok",
+            "answer": "Паспорт: https://example/passport.pdf",
+            "execution_mode": "agent_chat",
+            "meta": {
+                "retrieval_leaf_route_id": "passport_by_lamp_name",
+                "retrieval_selected_source": "corp_db",
+                "retrieval_route_id": "corp_kb.company_common",
+                "retrieval_used_fallback_route_id": "corp_kb.company_common",
+                "retrieval_used_fallback_scope": "cross_family",
+                "retrieval_evidence_status": "sufficient",
+            },
+        }
+        evaluation = evaluate_case_result(case, row)
+        self.assertTrue(evaluation["passed"])
+        self.assertTrue(evaluation["selection_ok"])
+        self.assertTrue(evaluation["execution_ok"])
+        self.assertTrue(evaluation["answer_correctness_ok"])
+
+        row["meta"]["retrieval_used_fallback_route_id"] = "corp_db.catalog_lookup"
+        evaluation = evaluate_case_result(case, row)
+        self.assertFalse(evaluation["passed"])
+        self.assertTrue(evaluation["selection_ok"])
+        self.assertFalse(evaluation["execution_ok"])
 
     def test_hybrid_validation_uses_bench_artifact_not_full_runtime_answer_shape(self):
         case = {

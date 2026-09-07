@@ -70,6 +70,9 @@ def main() -> None:
     tag_pass: dict[str, int] = {}
     validation_mode_totals: dict[str, int] = {}
     validation_mode_pass: dict[str, int] = {}
+    selection_totals = {"pass": 0, "fail": 0}
+    execution_totals = {"asserted": 0, "pass": 0, "fail": 0}
+    answer_correctness_totals = {"asserted": 0, "pass": 0, "fail": 0}
 
     for case in dataset:
         case_id = str(case.get("id") or "")
@@ -117,6 +120,13 @@ def main() -> None:
 
         evaluation = evaluate_case_result(case, row)
         errors = evaluation["errors"]
+        selection_totals["pass" if evaluation["selection_ok"] else "fail"] += 1
+        if evaluation["effective_routing_assertions"]:
+            execution_totals["asserted"] += 1
+            execution_totals["pass" if evaluation["execution_ok"] else "fail"] += 1
+        if evaluation["answer_correctness_ok"] is not None:
+            answer_correctness_totals["asserted"] += 1
+            answer_correctness_totals["pass" if evaluation["answer_correctness_ok"] else "fail"] += 1
         if evaluation["passed"]:
             pass_count += 1
             validation_mode_pass[validation_mode] = validation_mode_pass.get(validation_mode, 0) + 1
@@ -167,6 +177,9 @@ def main() -> None:
             for mode in sorted(validation_mode_totals.keys())
         },
         "routing_accuracy": routing_accuracy,
+        "routing_selection": selection_totals,
+        "effective_execution": execution_totals,
+        "answer_correctness": answer_correctness_totals,
     }
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -194,6 +207,11 @@ def main() -> None:
         for t in sorted(tag_totals.keys()):
             s = summary["tags"][t]
             lines.append(f"- `{t}`: {s['pass']}/{s['total']} (pass_rate={s['pass_rate']})")
+        lines.append("")
+        lines.append("## Contract dimensions")
+        lines.append(f"- Selection accuracy checks: {selection_totals['pass']}/{sum(selection_totals.values())}")
+        lines.append(f"- Effective execution/fallback checks: {execution_totals['pass']}/{execution_totals['asserted']} asserted")
+        lines.append(f"- Answer correctness checks: {answer_correctness_totals['pass']}/{answer_correctness_totals['asserted']} asserted")
         lines.append("")
         lines.append("## Validation modes")
         for mode in sorted(validation_mode_totals.keys()):
