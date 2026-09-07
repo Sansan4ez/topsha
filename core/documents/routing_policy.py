@@ -18,7 +18,7 @@ COMPANY_FACT_INTENT_KEYWORDS = {
     "requisites": ("реквизит", "инн", "кпп", "огрн"),
     "year_founded": ("сколько лет", "год основания", "основан", "основана", "история компании"),
     "website": ("официальный сайт", "сайт"),
-    "address": ("головной офис", "адрес", "офис", "где находится"),
+    "address": ("головной офис", "адрес", "где находится"),
     "socials": ("соцсет", "телеграм", "telegram", "youtube", "ютуб", "vk", "вконтакте", "канал"),
     "contacts": ("контакт", "телефон", "email", "e-mail", "почт", "связат", "консультац"),
     "about_company": ("о компании", "общая информация о компании", "расскажи о компании", "чем занимается компания", "наш профиль"),
@@ -260,12 +260,12 @@ def is_application_recommendation_intent(message: str) -> bool:
 
 def company_fact_intent_type(message: str) -> str:
     normalized = routing_message_text(message)
-    if (
-        is_document_lookup_intent(normalized)
-        or is_portfolio_lookup_intent(normalized)
-        or is_application_recommendation_intent(normalized)
-    ):
+    if is_document_lookup_intent(normalized) or is_portfolio_lookup_intent(normalized):
         return ""
+    # Strong company-fact phrases win before broad application vocabulary. In particular,
+    # «головной офис» contains the application word «офис», but it is unambiguously an address
+    # question. A bare «офис» is deliberately not an address cue, so office-lighting requests
+    # remain application recommendations.
     for subtype in (
         "requisites",
         "year_founded",
@@ -279,6 +279,8 @@ def company_fact_intent_type(message: str) -> str:
     ):
         if text_has_any(normalized, COMPANY_FACT_INTENT_KEYWORDS[subtype]):
             return subtype
+    if is_application_recommendation_intent(normalized):
+        return ""
     if text_has_any(normalized, COMPANY_FACT_KEYWORDS):
         return "about_company"
     return ""

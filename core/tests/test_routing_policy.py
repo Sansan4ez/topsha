@@ -24,6 +24,14 @@ class RoutingPolicyTests(unittest.TestCase):
         self.assertEqual(company_fact_intent_type("Какие используются комплектующие?"), "quality")
         self.assertEqual(company_common_topic_facets("Какие используются комплектующие?"), ["quality"])
 
+    def test_head_office_address_beats_broad_office_application_cue(self):
+        query = "Где находится головной офис компании? Укажи город и адрес."
+
+        self.assertEqual(company_fact_intent_type(query), "address")
+        self.assertEqual(company_common_topic_facets(query), ["contacts"])
+        self.assertIn("чайковского", expand_company_fact_query(query).lower())
+        self.assertEqual(company_fact_intent_type("Подбери освещение для офиса"), "")
+
     def test_rewrite_company_fact_search_args_keeps_existing_contract(self):
         rewritten = rewrite_company_fact_search_args(
             {"power_w_min": 0, "voltage_kind": "AC", "explosion_protected": False, "limit": 5},
